@@ -1,0 +1,2344 @@
+[
+  {
+    "project": "add-trailing-comma",
+    "clone_url": "https://github.com/asottile/add-trailing-comma.git",
+    "commit": "4aa21034cf9e0aef19376abd3922943400b16ee1",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "apispec",
+    "clone_url": "https://github.com/marshmallow-code/apispec.git",
+    "commit": "0b66a26b865772f5f461f97f99c5957790a3a8d7",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[yaml]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "marshmallow"
+      ],
+      [
+        "pip",
+        "install",
+        "openapi-spec-validator"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "arrow",
+    "clone_url": "https://github.com/arrow-py/arrow.git",
+    "commit": "2224255c4acc594d734cef0bbc83360452a67983",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "simplejson"
+      ],
+      [
+        "pip",
+        "install",
+        "pytz"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "astroid",
+    "clone_url": "https://github.com/PyCQA/astroid.git",
+    "commit": "b5e78cd8caaa223f6fb2e3e98c588915762d6abe",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "setuptools<81"
+      ],
+      [
+        "pip",
+        "install",
+        "attrs",
+        "python-dateutil",
+        "regex"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "autoflake",
+    "clone_url": "https://github.com/PyCQA/autoflake.git",
+    "commit": "8b019503c6fdb4e59df8293ec7d3115b4ebaec0b",
+    "test_dir": "test_autoflake.py test_fuzz.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "backoff",
+    "clone_url": "https://github.com/litl/backoff.git",
+    "commit": "d82b23c42d7a7e2402903e71e7a7f03014a00076",
+    "test_dir": "tests/test_backoff.py tests/test_integration.py tests/test_wait_gen.py tests/test_jitter.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "requests"
+      ],
+      [
+        "pip",
+        "install",
+        "responses"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "black",
+    "clone_url": "https://github.com/psf/black.git",
+    "commit": "1190eeb39527e1ed81f9b35c931af66f31d05186",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "aiohttp"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "bleach",
+    "clone_url": "https://github.com/mozilla/bleach.git",
+    "commit": "f0355a7af00500482c5292c6c83290c6a178068d",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "boltons",
+    "clone_url": "https://github.com/mahmoud/boltons.git",
+    "commit": "4e5faa3d7e4008d89e0d8bf1ea87b6d9a061a16d",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "cachetools",
+    "clone_url": "https://github.com/tkem/cachetools.git",
+    "commit": "6f23e2a7b75a42d30cb9d890ab3ca4059ee01bfd",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "chardet",
+    "clone_url": "https://github.com/chardet/chardet.git",
+    "commit": "88107b4ab8abc8b202fd145bc457b8b481557c87",
+    "test_dir": "tests/test_accuracy.py tests/test_api.py tests/test_ascii.py tests/test_binary.py tests/test_bom.py tests/test_cjk_gating.py tests/test_cli.py tests/test_confusion.py tests/test_detector.py tests/test_enums.py tests/test_equivalences.py tests/test_escape.py tests/test_evaluation.py tests/test_evidence_cap.py tests/test_github_issues.py tests/test_internal_utils.py tests/test_kernel_pxd.py tests/test_koi8t.py tests/test_language.py tests/test_magic.py tests/test_markup.py tests/test_mime_type.py tests/test_models.py tests/test_orchestrator.py tests/test_output_names.py tests/test_pipeline_types.py tests/test_postprocess.py tests/test_python_stdlib_limitations.py tests/test_registry.py tests/test_roundtrip_short.py tests/test_spec_bom_conformance.py tests/test_spec_decode_roundtrip.py tests/test_spec_iana.py tests/test_spec_whatwg.py tests/test_statistical.py tests/test_structural.py tests/test_substitutions.py tests/test_thread_safety.py tests/test_truncated_input.py tests/test_utf1632.py tests/test_utf8.py tests/test_utf8_equivalence.py tests/test_utils.py tests/test_validity.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "charset-normalizer",
+    "clone_url": "https://github.com/jawah/charset_normalizer.git",
+    "commit": "0a9201767e9d888b5a5ed7ca44400192474ad1b0",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "cleo",
+    "clone_url": "https://github.com/python-poetry/cleo.git",
+    "commit": "fd264efa3702c6de0231b8235741881d70bb4e3e",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "configupdater",
+    "clone_url": "https://github.com/pyscaffold/configupdater.git",
+    "commit": "d3484b7c0bf2aea968dfadf22cfff25fe12d3a37",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "convertdate",
+    "clone_url": "https://github.com/fitnr/convertdate.git",
+    "commit": "507a6cca54687dc6a6ec5c569a5a68e39e4b5c0c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "croniter",
+    "clone_url": "https://github.com/kiorky/croniter.git",
+    "commit": "4be99c39c411485e89598a19e8de52a276291c89",
+    "test_dir": "src/croniter/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pytz"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "dateparser",
+    "clone_url": "https://github.com/scrapinghub/dateparser.git",
+    "commit": "4c4c5e522deca82297ba9c43f0ce92d6ef94fcd4",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "parameterized"
+      ],
+      [
+        "pip",
+        "install",
+        "tzdata"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "diskcache",
+    "clone_url": "https://github.com/grantjenks/python-diskcache.git",
+    "commit": "ebfa37cd99d7ef716ec452ad8af4b4276a8e2233",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "django"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "docstring_parser",
+    "clone_url": "https://github.com/rr-/docstring_parser.git",
+    "commit": "8347d8fb347bd66e4bf5711d3df586357166944a",
+    "test_dir": "docstring_parser/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "emoji",
+    "clone_url": "https://github.com/carpedm20/emoji.git",
+    "commit": "d5d59d591f8590ada989f0bdf31603b3fe84e103",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "execnet",
+    "clone_url": "https://github.com/pytest-dev/execnet.git",
+    "commit": "12be14175b7764a85d17a2b69fac6005bbdf7e65",
+    "test_dir": "testing",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "fastjsonschema",
+    "clone_url": "https://github.com/horejsek/python-fastjsonschema.git",
+    "commit": "738da70db810d6b3c18800778f7ab24d37c2f681",
+    "test_dir": "tests/test_array.py tests/test_boolean.py tests/test_boolean_schema.py tests/test_common.py tests/test_compile_to_code.py tests/test_composition.py tests/test_const.py tests/test_default.py tests/test_examples.py tests/test_exceptions.py tests/test_fast_fail.py tests/test_format.py tests/test_integration.py tests/test_null.py tests/test_number.py tests/test_object.py tests/test_pattern_properties.py tests/test_pattern_serialization.py tests/test_security.py tests/test_string.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "feedparser",
+    "clone_url": "https://github.com/kurtmckee/feedparser.git",
+    "commit": "a22c5521cbb109871f1a2318948581901bd47e26",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "responses"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "flake8",
+    "clone_url": "https://github.com/PyCQA/flake8.git",
+    "commit": "567f9a96d96d343f92a7155da6c78b8a64f43b68",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "flask",
+    "clone_url": "https://github.com/pallets/flask.git",
+    "commit": "d086db856be187255b8ec61ef409357393020f32",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "asgiref",
+        "python-dotenv"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "flask-cors",
+    "clone_url": "https://github.com/corydolphin/flask-cors.git",
+    "commit": "ad4f355791dc251227a48a35419f5f144e44a22f",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "flask-login",
+    "clone_url": "https://github.com/maxcountryman/flask-login.git",
+    "commit": "c8bba84b9ba6768e878317fc46c54bd13fa1ac07",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "asgiref"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "fpdf2",
+    "clone_url": "https://github.com/py-pdf/fpdf2.git",
+    "commit": "14c0c102ec9991e7fcbbb1c68c8cf07f82b044e7",
+    "test_dir": "test/barcodes test/color_font test/drawing test/encryption test/errors test/fonts test/html test/layout test/metadata test/outline test/output_intents test/pattern test/pdf-a test/shapes test/svg test/template test/text test/text_region test/utils test/test_add_page.py test/test_alias.py test/test_annotations.py test/test_embed_file.py test/test_enums.py test/test_graphics_context.py test/test_linearization.py test/test_links.py test/test_mirror.py test/test_named_destinations.py test/test_opacity.py test/test_optional_content.py test/test_output.py test/test_page_format.py test/test_perfs.py test/test_positioning.py test/test_recorder.py test/test_rotation.py test/test_skew.py test/test_structure_tree.py test/test_syntax.py test/test_transform.py test/test_transitions.py test/table/test_table.py test/table/test_table_padding.py test/table/test_table_rowspan.py test/table/test_table_with_image.py test/image/alt_text test/image/image_types test/image/png_images test/image/png_indexed test/image/test_image_align.py test/image/test_image_clipping.py test/image/test_image_fit.py test/image/test_image_info.py test/image/test_load_image.py test/image/test_oversized.py test/image/test_url_images.py test/image/test_vector_image.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pillow",
+        "defusedxml"
+      ],
+      [
+        "pip",
+        "install",
+        "pypdf",
+        "qrcode"
+      ],
+      [
+        "pip",
+        "install",
+        "lxml",
+        "cryptography",
+        "uharfbuzz"
+      ],
+      [
+        "pip",
+        "install",
+        "brotli",
+        "endesive"
+      ]
+    ],
+    "verdict": "BASELINE-RED"
+  },
+  {
+    "project": "freezegun",
+    "clone_url": "https://github.com/spulec/freezegun.git",
+    "commit": "92d61b3f5c31942a1039713574487bdcfcdbbfff",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "funcy",
+    "clone_url": "https://github.com/Suor/funcy.git",
+    "commit": "e8febffd57f80db8ca3a55fb1edd0feee2290d61",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".",
+        "-r",
+        "test_requirements.txt"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "glom",
+    "clone_url": "https://github.com/mahmoud/glom.git",
+    "commit": "fd70d3051a6a1bcb5152ec2d8e2cdc8e852f95e6",
+    "test_dir": "glom/test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pyyaml"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "h11",
+    "clone_url": "https://github.com/python-hyper/h11.git",
+    "commit": "62c5068c971579d61fa1b55373390e12f25fd856",
+    "test_dir": "h11/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "holidays",
+    "clone_url": "https://github.com/vacanza/holidays.git",
+    "commit": "7fbad226a409b7c1e3cbfe2b1b3bed8a422c821e",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "numpy",
+        "polib"
+      ],
+      [
+        "python",
+        "scripts/l10n/generate_mo_files.py"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "iniconfig",
+    "clone_url": "https://github.com/pytest-dev/iniconfig.git",
+    "commit": "316fbfaf2752d89326e1e75b45cd070f5b5ace9a",
+    "test_dir": "testing",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "installer",
+    "clone_url": "https://github.com/pypa/installer.git",
+    "commit": "9b7fd286b85c5091390d4368709c46b35693b28c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "itsdangerous",
+    "clone_url": "https://github.com/pallets/itsdangerous.git",
+    "commit": "672971d66a2ef9f85151e53283113f33d642dabd",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "freezegun"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "jedi",
+    "clone_url": "https://github.com/davidhalter/jedi.git",
+    "commit": "65112c72c7d8984500c91361cfb74e781090530c",
+    "test_dir": "test",
+    "install": [
+      [
+        "pip",
+        "install",
+        ".[dev]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "BASELINE-RED"
+  },
+  {
+    "project": "jinja",
+    "clone_url": "https://github.com/pallets/jinja.git",
+    "commit": "5ef70112a1ff19c05324ff889dd30405b1002044",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "pytest-timeout",
+        "trio"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "jmespath",
+    "clone_url": "https://github.com/jmespath/jmespath.py.git",
+    "commit": "2812594e69d43098ef60f81f4efc404c071b0418",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "jsonpatch",
+    "clone_url": "https://github.com/stefankoegl/python-json-patch.git",
+    "commit": "858bcb5e7ac51a076d76beb9eb24635991a204d1",
+    "test_dir": "tests.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "jsonref",
+    "clone_url": "https://github.com/gazpachoking/jsonref.git",
+    "commit": "6331c78a7eb126ad3c908960ea95b6dd363f421d",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "jupyter-core",
+    "clone_url": "https://github.com/jupyter/jupyter_core.git",
+    "commit": "4c4f526adab04ae6bf7821f65a5adbd011aa27ac",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "lark",
+    "clone_url": "https://github.com/lark-parser/lark.git",
+    "commit": "9a4fb9c7458e8155636773a3cded0016d52516da",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".",
+        "-r",
+        "test-requirements.txt"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "loguru",
+    "clone_url": "https://github.com/Delgan/loguru.git",
+    "commit": "bce5dfd3b435b1d1658507d7e095ad7a9919bf1c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "freezegun"
+      ],
+      [
+        "pip",
+        "install",
+        "colorama"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "markdown",
+    "clone_url": "https://github.com/Python-Markdown/markdown.git",
+    "commit": "5e335ef7e7be8ff6692363c56d1352e71b8ef279",
+    "test_dir": "tests/test_apis.py tests/test_extensions.py tests/test_legacy.py tests/test_meta.py tests/test_syntax/blocks tests/test_syntax/inline tests/test_syntax/extensions/test_abbr.py tests/test_syntax/extensions/test_admonition.py tests/test_syntax/extensions/test_attr_list.py tests/test_syntax/extensions/test_code_hilite.py tests/test_syntax/extensions/test_def_list.py tests/test_syntax/extensions/test_fenced_code.py tests/test_syntax/extensions/test_footnotes.py tests/test_syntax/extensions/test_legacy_attrs.py tests/test_syntax/extensions/test_legacy_em.py tests/test_syntax/extensions/test_smarty.py tests/test_syntax/extensions/test_tables.py tests/test_syntax/extensions/test_toc.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pyyaml"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "markupsafe",
+    "clone_url": "https://github.com/pallets/markupsafe.git",
+    "commit": "4e111271b1494995708a9e878a10829b5e10c7ba",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "marshmallow",
+    "clone_url": "https://github.com/marshmallow-code/marshmallow.git",
+    "commit": "b762ea2d59ca52fe5df76b90de14bed7e5ec5607",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "simplejson"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "mistune",
+    "clone_url": "https://github.com/lepture/mistune.git",
+    "commit": "4bbaa04c391d650a2e1219781c9a9acd60571cce",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "more-itertools",
+    "clone_url": "https://github.com/more-itertools/more-itertools.git",
+    "commit": "4aeb4338ae1407d8da9723e86da99efeb446f719",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "nbformat",
+    "clone_url": "https://github.com/jupyter/nbformat.git",
+    "commit": "cfb73afdd2a7f358953f2a34f747fd0d0e9d6288",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "testpath"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "num2words",
+    "clone_url": "https://github.com/savoirfairelinux/num2words.git",
+    "commit": "07814cb114157f582c40a00119c2e9faba8dcee2",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "delegator.py"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "parse",
+    "clone_url": "https://github.com/r1chardj0n3s/parse.git",
+    "commit": "74d40e31f001e3f1cf05a997d08488d2cf5a1df3",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".",
+        "-r",
+        "tests/requirements.txt"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "parsel",
+    "clone_url": "https://github.com/scrapy/parsel.git",
+    "commit": "49321235a2e448c49f23ee068c9cdfc2d35a4317",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "psutil"
+      ],
+      [
+        "pip",
+        "install",
+        "jsonpath-rfc9535"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "parsimonious",
+    "clone_url": "https://github.com/erikrose/parsimonious.git",
+    "commit": "eb79639859a9697a86c0992a045174a8856b5fb0",
+    "test_dir": "parsimonious/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[testing]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "parso",
+    "clone_url": "https://github.com/davidhalter/parso.git",
+    "commit": "b26da16316da46e4770d589ed5f8d404531a22af",
+    "test_dir": "test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[testing]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "path",
+    "clone_url": "https://github.com/jaraco/path.git",
+    "commit": "b5ae11e41ba64a9e27fdc42d8c138d7db7699910",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "more-itertools"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pathspec",
+    "clone_url": "https://github.com/cpburnz/python-pathspec.git",
+    "commit": "00cba5ee0b02615f87f050ffc64de36916fd563d",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "petl",
+    "clone_url": "https://github.com/petl-developers/petl.git",
+    "commit": "364957617961c338657b202c169a461b935d1c32",
+    "test_dir": "petl/test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "platformdirs",
+    "clone_url": "https://github.com/tox-dev/platformdirs.git",
+    "commit": "6fe448ccf1837798f0adc3a577c61ee70c7d5c58",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ],
+      [
+        "pip",
+        "install",
+        "appdirs"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "poetry-core",
+    "clone_url": "https://github.com/python-poetry/poetry-core.git",
+    "commit": "b52c25c451bbaed9f309d45fc6e6e35c704e55bf",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ],
+      [
+        "pip",
+        "install",
+        "virtualenv"
+      ],
+      [
+        "pip",
+        "install",
+        "build",
+        "setuptools",
+        "tomli-w",
+        "trove-classifiers"
+      ]
+    ],
+    "verdict": "DIVERGED"
+  },
+  {
+    "project": "prompt-toolkit",
+    "clone_url": "https://github.com/prompt-toolkit/python-prompt-toolkit.git",
+    "commit": "6c7fbc1080dd331a031a2be1f96d4ebc0421f7ea",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "pytest-mock"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "puremagic",
+    "clone_url": "https://github.com/cdgriffith/puremagic.git",
+    "commit": "57bed56ef669132c0f906e1d064680bf2c4b2205",
+    "test_dir": "test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pycodestyle",
+    "clone_url": "https://github.com/PyCQA/pycodestyle.git",
+    "commit": "3cee4cc3b28f1fd166947e2c1fbe357c77e1ecaf",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyflakes",
+    "clone_url": "https://github.com/PyCQA/pyflakes.git",
+    "commit": "f0a8b98156ba1645a45bc7d77dcfe79dbbf11f10",
+    "test_dir": "pyflakes/test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pygments",
+    "clone_url": "https://github.com/pygments/pygments.git",
+    "commit": "156d85fdd18d34427fe893527e71da91dcfb0eb5",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "wcag-contrast-ratio"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyjwt",
+    "clone_url": "https://github.com/jpadilla/pyjwt.git",
+    "commit": "16231abfd1d8eab4953e8779b3017b859c88565e",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[crypto]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyopenssl",
+    "clone_url": "https://github.com/pyca/pyopenssl.git",
+    "commit": "da581a400cb3974453fc26a713ea3af8184ea2d1",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "cryptography"
+      ],
+      [
+        "pip",
+        "install",
+        "pretend"
+      ]
+    ],
+    "verdict": "BASELINE-RED"
+  },
+  {
+    "project": "pyparsing",
+    "clone_url": "https://github.com/pyparsing/pyparsing.git",
+    "commit": "810199f89bf916590426e1c5cb3d612584f11a2f",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "railroad-diagrams"
+      ],
+      [
+        "pip",
+        "install",
+        "jinja2"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pypdf",
+    "clone_url": "https://github.com/py-pdf/pypdf.git",
+    "commit": "b890401e0025afcc9ecb6cc6acba691ea7b085c8",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "git",
+        "submodule",
+        "update",
+        "--init",
+        "--depth",
+        "1"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pillow",
+        "cryptography"
+      ],
+      [
+        "pip",
+        "install",
+        "pyyaml"
+      ],
+      [
+        "pip",
+        "install",
+        "fontTools",
+        "pytest-timeout"
+      ]
+    ],
+    "verdict": "BASELINE-RED"
+  },
+  {
+    "project": "pyproject-hooks",
+    "clone_url": "https://github.com/pypa/pyproject-hooks.git",
+    "commit": "184c9f56a87ede1276a5b33f5024204adb792cd2",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "testpath"
+      ],
+      [
+        "pip",
+        "install",
+        "setuptools"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyquery",
+    "clone_url": "https://github.com/gawel/pyquery.git",
+    "commit": "de179ca321362ec9df8e2044d297f0506e3ed4ba",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "webtest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "python-dotenv",
+    "clone_url": "https://github.com/theskumar/python-dotenv.git",
+    "commit": "0b2880591780a426b0551436f47a17e7a76d954f",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "click"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "python-json-logger",
+    "clone_url": "https://github.com/nhairs/python-json-logger.git",
+    "commit": "0cb937dfdc68e09687632109665c2c7644342e1c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "freezegun"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "python-tabulate",
+    "clone_url": "https://github.com/astanin/python-tabulate.git",
+    "commit": "268615a5c27dc40e5c22454c07b44d5c50410da0",
+    "test_dir": "test",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "wcwidth"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyupgrade",
+    "clone_url": "https://github.com/asottile/pyupgrade.git",
+    "commit": "9c750258a396dfd86f21f1510dddad2a21191675",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".",
+        "-r",
+        "requirements-dev.txt"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "pyyaml",
+    "clone_url": "https://github.com/yaml/pyyaml.git",
+    "commit": "f5e4504a92f169f65350a1047dccb23bc97028be",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "qrcode",
+    "clone_url": "https://github.com/lincolnloop/python-qrcode.git",
+    "commit": "f92c007498d796e4825638b7d50c14ea51e5457a",
+    "test_dir": "qrcode/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pillow"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "radon",
+    "clone_url": "https://github.com/rubik/radon.git",
+    "commit": "54b88e5878b2724bf4d77f97349588b811abdff2",
+    "test_dir": "radon/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest-mock"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "reorder-python-imports",
+    "clone_url": "https://github.com/asottile/reorder-python-imports.git",
+    "commit": "48d613c407813ee467d5cef9b735fd065addfed9",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "schema",
+    "clone_url": "https://github.com/keleshev/schema.git",
+    "commit": "310a1239b62f500284ce3bd91b7dabf70467f23e",
+    "test_dir": "test_schema.py test_mypy_use_callable.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "segno",
+    "clone_url": "https://github.com/heuer/segno.git",
+    "commit": "b11dc2913c22b22b3bc0a6efaa989904c44977bf",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pypng"
+      ],
+      [
+        "pip",
+        "install",
+        "pillow"
+      ],
+      [
+        "pip",
+        "install",
+        "qrcode-artistic"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "simplejson",
+    "clone_url": "https://github.com/simplejson/simplejson.git",
+    "commit": "9950b7e5f4443fff8defb51e80e41ab40d0a36b9",
+    "test_dir": "simplejson/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "slugify",
+    "clone_url": "https://github.com/un33k/python-slugify.git",
+    "commit": "35aca63fc2672cba2c739ff6dff685a4f26a4f9a",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "sortedcontainers",
+    "clone_url": "https://github.com/grantjenks/python-sortedcontainers.git",
+    "commit": "3ac358631f58c1347f1d6d2d92784117db0f38ed",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "soupsieve",
+    "clone_url": "https://github.com/facelessuser/soupsieve.git",
+    "commit": "e688706fc6a2a8c62a27cfdcd3df00d03a3ceaa6",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "beautifulsoup4"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "sqlparse",
+    "clone_url": "https://github.com/andialbrecht/sqlparse.git",
+    "commit": "60cdc649726bf1bc4f1b336050560b336da715ec",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "tablib",
+    "clone_url": "https://github.com/jazzband/tablib.git",
+    "commit": "966876c76a6378557c1951badc1665b4d1375875",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "openpyxl",
+        "xlrd",
+        "odfpy",
+        "pyyaml"
+      ],
+      [
+        "pip",
+        "install",
+        "tabulate"
+      ],
+      [
+        "pip",
+        "install",
+        "xlwt"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "tenacity",
+    "clone_url": "https://github.com/jd/tenacity.git",
+    "commit": "32ac68f0941319c0d2f4fb927f96e4ee29bb46c6",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[test]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "tinydb",
+    "clone_url": "https://github.com/msiemens/tinydb.git",
+    "commit": "edff96aeb2616402e9489d46e90a592c05565621",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "tomli",
+    "clone_url": "https://github.com/hukkin/tomli.git",
+    "commit": "43a86ade8b795c6ef9b4ec53372a607cd1ed426f",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "tomlkit",
+    "clone_url": "https://github.com/python-poetry/tomlkit.git",
+    "commit": "eddd27e43a62fe58707c311bfad2f52e72493f53",
+    "test_dir": "tests/test_api.py tests/test_build.py tests/test_items.py tests/test_parser.py tests/test_toml_document.py tests/test_toml_file.py tests/test_types.py tests/test_utils.py tests/test_write.py",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "toolz",
+    "clone_url": "https://github.com/pytoolz/toolz.git",
+    "commit": "451af60dec590a6010e2babdbf391ea8f815122f",
+    "test_dir": "toolz/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "validators",
+    "clone_url": "https://github.com/python-validators/validators.git",
+    "commit": "22786cc6e7283a0fa452c179797e447f798db9f0",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        ".[crypto-eth-addresses]"
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "voluptuous",
+    "clone_url": "https://github.com/alecthomas/voluptuous.git",
+    "commit": "44593ce7c330faf9418252c4b5448f4736144a7f",
+    "test_dir": "voluptuous/tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "vulture",
+    "clone_url": "https://github.com/jendrikseipp/vulture.git",
+    "commit": "edd5806f56f0bec1d0fbb45c466c0f7a258a1795",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "pint"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "webob",
+    "clone_url": "https://github.com/Pylons/webob.git",
+    "commit": "c0d70f985ff6f04dcc59822ca5216cfd0ada666c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "werkzeug",
+    "clone_url": "https://github.com/pallets/werkzeug.git",
+    "commit": "6c4c680f5392342a68065114987f39160388064c",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "cffi",
+        "cryptography",
+        "ephemeral-port-reserve",
+        "pytest-timeout",
+        "watchdog"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "wheel",
+    "clone_url": "https://github.com/pypa/wheel.git",
+    "commit": "4ae6d07d38611cb0619864621c06fc032622eaef",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest",
+        "setuptools"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "wtforms",
+    "clone_url": "https://github.com/wtforms/wtforms.git",
+    "commit": "c9dc8995bbb1174292fa50bfc56ac3a63887ca44",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ],
+      [
+        "pip",
+        "install",
+        "email-validator"
+      ],
+      [
+        "pip",
+        "install",
+        "babel"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  },
+  {
+    "project": "xmltodict",
+    "clone_url": "https://github.com/martinblech/xmltodict.git",
+    "commit": "6e29fba282e68631034dd2722a413b4e35276584",
+    "test_dir": "tests",
+    "install": [
+      [
+        "pip",
+        "install",
+        "-e",
+        "."
+      ],
+      [
+        "pip",
+        "install",
+        "pytest"
+      ]
+    ],
+    "verdict": "FULL-PARITY"
+  }
+]

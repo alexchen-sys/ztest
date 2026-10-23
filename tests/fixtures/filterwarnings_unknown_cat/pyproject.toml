@@ -1,0 +1,2 @@
+[tool.pytest.ini_options]
+filterwarnings = ["error::no_such_mod.SomeWarning"]

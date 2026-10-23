@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Native test suite
+        run: zig build test
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: pip install "pytest>=9,<10"
+
+      - name: Behavioral gate (OSS regression fixtures)
+        run: ZTEST_BIN=zig-out/bin/ztest python3 -m pytest tests/test_oss_regressions.py -q
+
+      - name: Docs cross-check (invariant keys and links)
+        run: python3 scripts/check_docs.py
+
+      - name: Smoke run
+        run: |
+          zig-out/bin/ztest --version
+          zig-out/bin/ztest --collect-only tests/fixtures/python_files/tests
