@@ -4,12 +4,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Release artifacts must be sterile: debug info embeds absolute build paths
+    // (cache dirs, toolchain dirs, source roots) into the binary and inflates it
+    // ~5x. Strip by default for every non-Debug build; `-Dstrip=false` opts out.
+    // NB: the enum members are lowercase (`.debug`) in this toolchain; the
+    // capitalized `Optimize.Debug` spelling is only a deprecated alias decl and
+    // cannot be used as an inferred enum literal.
+    const strip = b.option(bool, "strip", "Strip debug symbols") orelse (optimize != .debug);
+
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        // std.c.getenv ($VIRTUAL_ENV, $PATH) needs libc explicitly linked.
-        .link_libc = true,
+        .strip = strip,
+        // No `.link_libc`: nothing in the tree calls into libc (env is read via
+        // std.process.Init.environ_map), so musl targets link fully static and
+        // the glibc target keeps a stable, distro-independent ABI surface.
     });
 
     const exe = b.addExecutable(.{

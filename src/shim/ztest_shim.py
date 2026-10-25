@@ -60,6 +60,7 @@ import pathlib
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -85,7 +86,7 @@ _REAL_MONOTONIC = time.monotonic
 _REAL_MONOTONIC_NS = time.monotonic_ns
 _REAL_PERF_COUNTER_NS = time.perf_counter_ns
 
-SHIM_VERSION = "0.5.0-zig017.14"  # Part of the AST-cache key: a bump invalidates all cached modules (encode/audit semantics). Scope: unittest delegation (ZtestResult + _wrap_phase + teardown-dominance flag), scope-registry fixtures, buffered IPC transport, heartbeat rate-limit, zygote prewarm, full AST assert rewriter (Compare chains, BoolOp, UnaryOp, Call, lazy Or repr), builtin fixture parity (doctest_namespace, capsysbinary, capfdbinary, capteesys, record_property), ExceptionInfo._excinfo, empty parametrize skip, --engine=pytest bridge, safe assert repr.
+SHIM_VERSION = "0.5.1-zig017.15"  # Part of the AST-cache key: a bump invalidates all cached modules (encode/audit semantics). Scope: unittest delegation (ZtestResult + _wrap_phase + teardown-dominance flag), scope-registry fixtures, buffered IPC transport, heartbeat rate-limit, zygote prewarm, full AST assert rewriter (Compare chains, BoolOp, UnaryOp, Call, lazy Or repr), builtin fixture parity (doctest_namespace, capsysbinary, capfdbinary, capteesys, record_property), ExceptionInfo._excinfo, empty parametrize skip, --engine=pytest bridge, safe assert repr.
 ZTST_MAGIC = 0x5A545354  # "ZTST"
 IPC_TARGET_FD = 199
 PR_SET_PDEATHSIG = 1
@@ -490,9 +491,19 @@ class _StrictXPassError(OutcomeException):
     pass
 
 
-class _TestTimeoutError(BaseException):
-    """Per-test timeout: BaseException — never swallowed by a bare `except Exception` and never matched by xfail/skip."""
+class TestTimeoutError(BaseException):
+    """Per-test timeout: BaseException — never swallowed by a bare `except Exception` and never matched by xfail/skip.
+
+    Public name (UX audit A3): the error reaches the user as ``TestTimeoutError``, not
+    the private ``_TestTimeoutError`` spelling of an internal class.
+    """
     pass
+
+
+# Backward-compatibility alias: the whole shim (and any third party importing the
+# internal name) keeps resolving; the class object and its ``__name__`` are the
+# single public one above.
+_TestTimeoutError = TestTimeoutError
 
 
 def _cancel_pending_loop_tasks(case: Any, budgets: Any = None) -> None:
@@ -2385,6 +2396,54 @@ class TmpPathFactory:
         shutil.rmtree(self._base, ignore_errors=True)
 
 
+# The live config of the file being run (ConfigStub). Some builtin fixtures
+# delegate to the installed third-party implementation, whose constructor
+# expects a real pytest config object; set per file in _run_test_file_impl.
+_ZT_ACTIVE_CONFIG: Any = None
+
+
+def _make_mocker_fixture() -> Any:
+    """`mocker`: the installed pytest-mock MockerFixture when available, else the in-shim stub.
+
+    platformdirs' suite (and anything using pytest-mock features the stub does
+    not model) needs the real fixture; the name was previously hard-wired to
+    the stub. Construction is signature-tolerant: pytest-mock's
+    `MockerFixture(config, patcher)` changed across releases, so every plausible
+    shape is tried and anything unexpected falls back to the stub instead of
+    failing the test.
+    """
+    plugin: Any = None
+    for _mod_name in ("pytest_mock.plugin", "pytest_mock"):
+        try:
+            _cand = importlib.import_module(_mod_name)
+        except Exception:
+            continue
+        if getattr(_cand, "MockerFixture", None) is not None:
+            plugin = _cand
+            break
+    cls = getattr(plugin, "MockerFixture", None)
+    if cls is None:
+        return MockerFixture()
+    cfg = _ZT_ACTIVE_CONFIG
+    patcher: Any = None
+    _patcher_cls = getattr(plugin, "Patcher", None)
+    if _patcher_cls is not None and cfg is not None:
+        try:
+            patcher = _patcher_cls(cfg)
+        except Exception:
+            patcher = None
+    for _args in ((cfg, patcher), (cfg,), (patcher,), ()):
+        if _args == (cfg, patcher) and (patcher is None or cfg is None):
+            continue
+        try:
+            mk = cls(*_args)
+        except Exception:
+            continue
+        if hasattr(mk, "stopall") and hasattr(mk, "patch"):
+            return mk
+    return MockerFixture()
+
+
 class MockerFixture:
     def __init__(self) -> None:
         self._patches: list[Any] = []
@@ -2500,6 +2559,97 @@ def _safe_assert_repr(val: Any) -> str:
         return f"<[{type(exc).__name__}({str(exc)!r}) raised in repr()] {type(val).__name__} object at 0x{id(val):x}>"
 
 
+def _ztest_structured_diff(op: str, left: Any, right: Any) -> str | None:
+    """Human-readable diff for ``assert a == b`` on containers and multiline strings.
+
+    Returns None when the operands are not worth a structural diff (small
+    scalars), so the caller falls back to the plain Left/Right rendering.
+    Never raises: user containers may hold objects whose repr or __eq__ is
+    broken, and a diagnostic helper must not replace the original AssertionError.
+    Output is capped like the unified diff so --llm stays compact.
+    """
+    import difflib
+    import pprint
+
+    def _lines(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return value.splitlines()
+        if isinstance(value, (set, frozenset)):
+            try:
+                ordered = sorted(value)
+            except TypeError:
+                ordered = sorted(value, key=repr)
+            return [_safe_assert_repr(v) for v in ordered]
+        if isinstance(value, dict):
+            try:
+                return pprint.pformat(value, sort_dicts=True, width=60).splitlines()
+            except Exception:
+                return [_safe_assert_repr(value)]
+        if isinstance(value, (list, tuple)):
+            try:
+                return pprint.pformat(value, width=60).splitlines()
+            except Exception:
+                return [_safe_assert_repr(value)]
+        return []
+
+    if op != "==":
+        return None
+    if not isinstance(left, (dict, list, tuple, set, frozenset, str)):
+        return None
+    if type(left) is not type(right) and not (
+        isinstance(left, (set, frozenset)) and isinstance(right, (set, frozenset))
+    ):
+        return None
+    if isinstance(left, str) and ("\n" not in left and "\n" not in right):
+        return None
+    # Small dicts collapse to one pformat line; a per-key delta is far more
+    # useful than replacing the whole line. Compute it BEFORE the expensive
+    # pformat lines so a big dict does not pay for both renderings.
+    if isinstance(left, dict) and isinstance(right, dict):
+        try:
+            added = sorted(set(right) - set(left), key=repr)
+            removed = sorted(set(left) - set(right), key=repr)
+            shared = set(left) & set(right)
+            changed = []
+            for k in shared:
+                try:
+                    if left[k] != right[k]:
+                        changed.append(k)
+                except Exception:
+                    # Ambiguous truth (numpy) or broken __eq__: still show the pair.
+                    changed.append(k)
+            changed.sort(key=repr)
+        except Exception:
+            return None
+        delta: list[str] = []
+        for k in changed:
+            delta.append(f"~ {k!r}: {_safe_assert_repr(left[k])} -> {_safe_assert_repr(right[k])}")
+        for k in removed:
+            delta.append(f"- {k!r}: {_safe_assert_repr(left[k])} (only in left)")
+        for k in added:
+            delta.append(f"+ {k!r}: {_safe_assert_repr(right[k])} (only in right)")
+        if delta:
+            max_delta = 80
+            if len(delta) > max_delta:
+                delta = delta[:max_delta] + [f"... {len(delta) - max_delta} more changed keys"]
+            return "\n".join(delta)
+    left_lines = _lines(left)
+    right_lines = _lines(right)
+    if not left_lines and not right_lines:
+        return None
+    diff = list(
+        difflib.unified_diff(
+            left_lines, right_lines, fromfile="left", tofile="right", lineterm="", n=2
+        )
+    )
+    if not diff:
+        return None
+    max_lines = 80
+    if len(diff) > max_lines:
+        diff = diff[:max_lines] + [f"... diff truncated ({len(diff) - max_lines} more lines)"]
+    return "\n".join(diff)
+
+
 def _ztest_assert_format(idx: int, op: str, left: Any, right: Any, expr_src: str, msg: Any = None) -> str:
     # Called only on the failing branch — the message is lazy, like the native assert; idx is a diagnostic counter, not baked into the text. Invariants: REWRITE-PRESERVES-SCOPE.
     _ = idx
@@ -2509,7 +2659,24 @@ def _ztest_assert_format(idx: int, op: str, left: Any, right: Any, expr_src: str
         lr = lr[:297] + "..."
     if len(rr) > 300:
         rr = rr[:297] + "..."
-    text = f"assert {expr_src}\n  Left:  {lr}\n  Right: {rr} (op: {op})"
+    text = f"assert {expr_src}\n  Left:  {lr}\n  Right: {rr}"
+    if op == "==":
+        # UX audit: drop the noisy ``(op: ==)`` suffix and, for containers and
+        # multiline strings, append a structural diff instead of leaving the
+        # user with two 300-char truncated reprs.
+        diff = None
+        try:
+            diff = _ztest_structured_diff(op, left, right)
+        except BaseException:
+            # Diagnostics must never replace the user's AssertionError with a
+            # helper failure (broken repr / hostile container / numpy truth).
+            diff = None
+        if diff is not None:
+            text = f"{text}\n  Difference (left vs right):\n" + "\n".join(
+                f"    {line}" for line in diff.splitlines()
+            )
+    else:
+        text = f"{text} (op: {op})"
     if msg is not None:
         return f"{msg}\n{text}"
     return text
@@ -3119,6 +3286,136 @@ def _ini_options_cached(rootpath: Path) -> dict[str, Any]:
     return {k: (list(v) if isinstance(v, list) else v) for k, v in cached.items()}
 
 
+def _addopts_selection_filters(ini_dir: Path) -> tuple[str, str, int]:
+    """`-k` / `-m` / `--maxfail` parsed out of ini `addopts` (pytest appends addopts to argv).
+
+    The supervisor's CLI carries no addopts channel (its bench protocol passes
+    `-o addopts=` explicitly), so the shim recovers the selection filters the
+    ini asks for: poetry-core's `addopts = "-m 'not integration'"` must deselect
+    its integration tests under BOTH engines — including the bridge's
+    `-o addopts=` retry, which by construction drops the ini addopts.
+
+    Token grammar, in the order pytest itself resolves it:
+
+    1. exact spellings — `-k`/`--keyword`, `-m`/`--markexpr`, `--maxfail`,
+       `-x` and their `--opt=value` forms. These are consumed first, so the
+       maxfail options can never be mistaken for a `-m` expression;
+    2. attached short forms `-k<expr>` / `-m<expr>` (`-kfast`, `-mnot`), which
+       argparse also accepts. A token that carries a second hyphenated word
+       (`-keep-logs`, `-mypy-args`) is an option name, not a filter expression,
+       and `-maxfail` is the long maxfail option spelled with one dash — both
+       are refused, so a plugin flag is never reconstructed as a selection
+       filter. The plugin registry is the only authority that could resolve the
+       remaining ambiguity, and it is not loaded on this fast path; the cost of
+       being wrong here (deselecting everything) is worse than ignoring a
+       filter, so the ambiguous forms are left to pytest.
+
+    Returns (k_expr, m_expr, maxfail); any of them may be empty/0.
+    """
+    try:
+        raw = _ini_options_cached(ini_dir).get("addopts") or ""
+    except Exception:
+        return ("", "", 0)
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(str(part) for part in raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return ("", "", 0)
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        argv = raw.split()
+    k_expr = ""
+    m_expr = ""
+    maxfail = 0
+
+    def attached_value(tok: str, flag: str) -> str | None:
+        """Value of an attached short selection option, or None if it is an option name."""
+        if not tok.startswith(flag) or len(tok) <= len(flag):
+            return None
+        if tok.startswith("-maxfail"):
+            # pytest's maxfail option with one dash instead of two: an option,
+            # not the `-m` expression "axfail".
+            return None
+        value = tok[len(flag):]
+        if "-" in value:
+            return None
+        return value
+
+    idx = 0
+    while idx < len(argv):
+        tok = argv[idx]
+        nxt = argv[idx + 1] if idx + 1 < len(argv) else ""
+        if tok in ("-k", "--keyword") and nxt:
+            k_expr = nxt
+            idx += 2
+            continue
+        if tok in ("-m", "--markexpr") and nxt:
+            m_expr = nxt
+            idx += 2
+            continue
+        if tok == "--maxfail" and nxt:
+            try:
+                maxfail = int(nxt)
+            except ValueError:
+                maxfail = 0
+            idx += 2
+            continue
+        if tok == "-x":
+            maxfail = 1
+        elif tok.startswith("--maxfail="):
+            try:
+                maxfail = int(tok.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif tok.startswith("--keyword="):
+            k_expr = tok.split("=", 1)[1]
+        elif tok.startswith("--markexpr="):
+            m_expr = tok.split("=", 1)[1]
+        elif (value := attached_value(tok, "-k")) is not None:
+            k_expr = value
+        elif (value := attached_value(tok, "-m")) is not None:
+            m_expr = value
+        idx += 1
+    return (k_expr.strip(), m_expr.strip(), maxfail)
+
+
+def _with_ini_addopts_filters(filepath_str: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Fold ini addopts `-k`/`-m`/`--maxfail` into the per-file options.
+
+    A value passed on the CLI always wins (pytest's own precedence: addopts come
+    first, an explicit CLI flag later overrides them), so the ini value is used
+    only where the supervisor sent nothing.
+    """
+    cli_k = str(options.get("k_expr") or "").strip()
+    cli_m = str(options.get("m_expr") or "").strip()
+    cli_mf = options.get("maxfail") or 0
+    try:
+        cli_mf = int(cli_mf)
+    except Exception:
+        cli_mf = 0
+    if cli_k and cli_m and cli_mf:
+        return options
+    try:
+        raw_target = filepath_str.split("::", 1)[0] if "::" in filepath_str else filepath_str
+        filepath = Path(raw_target).resolve()
+        rootpath = Path(options.get("rootdir") or os.getcwd()).resolve()
+        # The ini the shim's ConfigStub reads for this file (same discovery).
+        ini_dir = _discover_ini_dir(filepath.parent) or rootpath
+    except Exception:
+        return options
+    ini_k, ini_m, ini_mf = _addopts_selection_filters(ini_dir)
+    if not (ini_k or ini_m or ini_mf):
+        return options
+    out = dict(options)
+    if not cli_k and ini_k:
+        out["k_expr"] = ini_k
+    if not cli_m and ini_m:
+        out["m_expr"] = ini_m
+    if not cli_mf and ini_mf:
+        out["maxfail"] = ini_mf
+    return out
+
+
 def _warm_ini_options_cache(rootpath: Path) -> None:
     """Prewarm the ini-options cache in the zygote (before gc.freeze()); errors are silenced by the caller."""
     try:
@@ -3208,6 +3505,158 @@ def _iter_plugin_names(raw: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         return [str(p).strip() for p in raw if str(p).strip()]
     return []
+
+
+# pytest11 entry points: pytest loads every installed plugin declaring this
+# group at startup, so a package that ships its fixtures as an entry-point
+# plugin (platformdirs' own pytest11 plugin is the Bench-100 case) has them
+# under pytest and none under the native shim, which only walked ini
+# `plugins=` and conftest `pytest_plugins`. Enumerated once per process
+# (importlib.metadata scans every sys.path distribution) and prewarmed in
+# the zygote before gc.freeze().
+_PYTEST11_ENTRYPOINT_CACHE: list[tuple[str, str]] | None = None
+# Plugins whose presence in the shim's process would fight the supervisor
+# (worker pools, coverage writing, output decoration) — never auto-loaded.
+_PYTEST11_SKIP_HINTS = ("xdist", "cov", "sugar", "html")
+
+
+def _pytest11_entry_points() -> list[tuple[str, str]]:
+    """(name, module) of installed pytest11 entry points, minus the skipped ones."""
+    global _PYTEST11_ENTRYPOINT_CACHE
+    cached = _PYTEST11_ENTRYPOINT_CACHE
+    if cached is not None:
+        return cached
+    found: list[tuple[str, str]] = []
+    if os.environ.get("ZTEST_NO_ENTRYPOINT_PLUGINS") != "1" and os.environ.get("ZTEST_PYTEST11_FULL") == "1":
+        try:
+            from importlib import metadata as _importlib_metadata
+
+            _eps = list(_importlib_metadata.entry_points(group="pytest11"))
+        except Exception:
+            _eps = []
+        for _ep in _eps:
+            try:
+                _ep_name = str(getattr(_ep, "name", "") or "").strip()
+                _ep_value = str(getattr(_ep, "value", "") or "").strip()
+            except Exception:
+                continue
+            # value is "module" or "module:attr"
+            _ep_mod = _ep_value.split(":", 1)[0].strip()
+            if not _ep_name or not _ep_mod:
+                continue
+            _lower = _ep_name.lower()
+            if any(_hint in _lower for _hint in _PYTEST11_SKIP_HINTS):
+                continue
+            found.append((_ep_name, _ep_mod))
+    if not found and os.environ.get("ZTEST_NO_ENTRYPOINT_PLUGINS") != "1" and os.environ.get("ZTEST_PYTEST11_FULL") != "1":
+        # Default path: a hand scan of sys.path metadata directories. Building
+        # importlib.metadata Distribution objects for a typical venv costs ~24 ms
+        # per worker process (each file is a fresh process) — too much for the
+        # per-file budget. Only entry_points.txt files are opened, and only the
+        # [pytest11] section is parsed. ZTEST_PYTEST11_FULL=1 keeps the
+        # importlib.metadata scan for exotic layouts (zip/egg installs).
+        found = _scan_pytest11_entry_points_fast()
+    _PYTEST11_ENTRYPOINT_CACHE = found
+    return found
+
+
+def _scan_pytest11_entry_points_fast() -> list[tuple[str, str]]:
+    """(name, module) of pytest11 entry points found by reading dist metadata directly."""
+    found: list[tuple[str, str]] = []
+    seen_dirs: set[str] = set()
+    for _entry in list(sys.path):
+        if not _entry:
+            continue
+        _dir = _entry
+        if _dir in seen_dirs:
+            continue
+        seen_dirs.add(_dir)
+        try:
+            _names = os.listdir(_dir)
+        except OSError:
+            continue
+        for _name in _names:
+            _lower = _name.lower()
+            if not (_lower.endswith(".dist-info") or _lower.endswith(".egg-info")):
+                continue
+            _ep_path = os.path.join(_dir, _name, "entry_points.txt")
+            try:
+                with open(_ep_path, "r", encoding="utf-8", errors="replace") as _fh:
+                    _text = _fh.read(1 << 16)
+            except OSError:
+                continue
+            if "pytest11" not in _text:
+                continue
+            _section = ""
+            for _line in _text.splitlines():
+                _line = _line.strip()
+                if not _line or _line[0] in "#;":
+                    continue
+                if _line.startswith("[") and _line.endswith("]"):
+                    _section = _line[1:-1].strip()
+                    continue
+                if _section != "pytest11" or "=" not in _line:
+                    continue
+                _ep_name, _, _ep_value = _line.partition("=")
+                _ep_name = _ep_name.strip()
+                _ep_mod = _ep_value.strip().split(":", 1)[0].strip()
+                if not _ep_name or not _ep_mod:
+                    continue
+                _lower_name = _ep_name.lower()
+                if any(_hint in _lower_name for _hint in _PYTEST11_SKIP_HINTS):
+                    continue
+                found.append((_ep_name, _ep_mod))
+    return found
+
+
+def _entrypoint_plugin_in_project(mod_name: str, rootpath: Path) -> bool:
+    """Whether a pytest11 plugin's module lives inside the project being run.
+
+    The entry-point list is global to the environment; only the project's own
+    plugin is loaded by default so an unrelated installed plugin (pytest-timeout,
+    anyio, ...) never enters a worker under the shim's pytest stub. Resolution
+    goes through find_spec: it imports the parent package only. Memoized per
+    (module, rootdir) — find_spec walks sys.path and imports the parent package,
+    which must not be paid per file.
+    """
+    _cache_key = (mod_name, str(rootpath))
+    _cached = _PYTEST11_PROJECT_CACHE.get(_cache_key)
+    if _cached is not None:
+        return _cached
+    _verdict = _entrypoint_plugin_in_project_uncached(mod_name, rootpath)
+    _PYTEST11_PROJECT_CACHE[_cache_key] = _verdict
+    return _verdict
+
+
+# Verdict cache for _entrypoint_plugin_in_project (module, rootdir) → bool.
+_PYTEST11_PROJECT_CACHE: dict[tuple[str, str], bool] = {}
+
+
+def _entrypoint_plugin_in_project_uncached(mod_name: str, rootpath: Path) -> bool:
+    try:
+        _spec = importlib.util.find_spec(mod_name)
+    except Exception:
+        return False
+    if _spec is None:
+        return False
+    _origin = getattr(_spec, "origin", None) or ""
+    if not _origin or _origin in ("built-in", "frozen"):
+        _locs = list(getattr(_spec, "submodule_search_locations", None) or [])
+        _origin = str(_locs[0]) if _locs else ""
+    if not _origin:
+        return False
+    try:
+        return Path(_origin).resolve().is_relative_to(rootpath)
+    except Exception:
+        return False
+
+
+def _warm_pytest11_entrypoint_cache() -> None:
+    """Prewarm the entry-point list in the zygote (COW-shared; errors silenced)."""
+    try:
+        _pytest11_entry_points()
+    except BaseException:
+        pass
 
 
 def _parse_warn_filters(raw: Any) -> list[tuple[str, str, type, str, int]]:
@@ -3789,7 +4238,9 @@ class FixtureResolver:
             self.cache["function"][key] = bm
             return bm
         if name == "mocker":
-            mk = MockerFixture()
+            # Delegates to the installed pytest-mock (platformdirs' pytest11
+            # suite), stub fallback when the package is absent.
+            mk = _make_mocker_fixture()
             self.add_finalizer("function", mk.stopall)
             self.cache["function"][key] = mk
             return mk
@@ -4148,6 +4599,11 @@ def _pytest_main_stub(args: Any = None, plugins: Any = None) -> int:
     )
 
 
+# sys.modules entries written by install_pytest_modules() (name → object); see
+# _ensure_real_pytest_modules.
+_INSTALLED_STUB_MODULES: dict[str, types.ModuleType] = {}
+
+
 def install_pytest_modules() -> None:
     pytest_mod = _PytestModule("pytest")
     pytest_mod.__version__ = "9.0.3+ztest"
@@ -4299,6 +4755,42 @@ def install_pytest_modules() -> None:
     sys.modules["_pytest.recwarn"] = recwarn_mod
     sys.modules["_pytest.tmpdir"] = tmpdir_mod
     sys.modules["_pytest.capture"] = capture_mod
+    # Bookkeeping for the reverse direction: a native worker that delegates a
+    # pytester file to the real-pytest bridge has to hand sys.modules back to
+    # upstream pytest, and it must remove exactly these entries (see
+    # _ensure_real_pytest_modules).
+    global _INSTALLED_STUB_MODULES
+    _INSTALLED_STUB_MODULES = {
+        _n: _m
+        for _n, _m in sys.modules.items()
+        if _n == "pytest" or _n == "_pytest" or _n.startswith("_pytest.")
+    }
+
+
+def _ensure_real_pytest_modules() -> None:
+    """Undo install_pytest_modules() so the bridge can drive upstream pytest.
+
+    The native engine installs the shim's pytest stubs process-wide; the
+    automatic pytester delegation (native engine -> real-pytest bridge) runs the
+    file through real pytest, so the stub entries are removed first. Nothing is imported here: when no
+    upstream pytest exists, the bridge reports the usual EngineError. A pytest
+    engine run already has the real package in sys.modules (the stubs were never
+    installed) and this is a no-op.
+    """
+    if os.environ.get("ZTEST_ENGINE") == "pytest" or not _INSTALLED_STUB_MODULES:
+        return
+    try:
+        if importlib.machinery.PathFinder.find_spec("pytest") is None:
+            return
+    except Exception:
+        return
+    for _n, _stub in list(_INSTALLED_STUB_MODULES.items()):
+        if sys.modules.get(_n) is _stub:
+            try:
+                del sys.modules[_n]
+            except KeyError:
+                pass
+    _INSTALLED_STUB_MODULES.clear()
 
 
 # ============================================================================
@@ -6264,6 +6756,79 @@ def _guard_body_return(res: Any, case: unittest.TestCase) -> None:
         )
 
 
+# ============================================================================
+# Call-boundary parity (Bench-100: freezegun runner identity, astroid depth)
+#
+# freezegun/api.py decides whether a frozen ticker survives into the next
+# test by scanning inspect.stack() for a frame whose module name starts with
+# '_pytest.' (its "are we inside the pytest runner" probe). The native shim
+# calls the test function from ztest_shim, so that probe finds nothing and
+# the frozen time is reset (freezegun::test_time_freeze_stays_across_tests).
+# The final call therefore goes through a one-line trampoline whose
+# f_globals['__name__'] is '_pytest.runner' — exactly the frame pytest's own
+# runner supplies. The trampoline is created lazily (never at import time:
+# --engine=pytest must keep the real _pytest.runner untouched) and its code
+# object carries the shim's own filename, so failure reports keep filtering
+# it as an internal runner frame.
+_ZT_CALL_TRAMPOLINE: Any = None
+_ZT_CALL_TRAMPOLINE_SRC = "def _ztest_call_trampoline(fn, kwargs):\n    return fn(**kwargs)\n"
+
+
+def _ztest_call_trampoline() -> Any:
+    """The single call-boundary trampoline (its frame's module is '_pytest.runner')."""
+    global _ZT_CALL_TRAMPOLINE
+    tramp = _ZT_CALL_TRAMPOLINE
+    if tramp is not None:
+        return tramp
+    mod = sys.modules.get("_pytest.runner")
+    tramp = getattr(mod, "_ztest_call_trampoline", None) if mod is not None else None
+    if tramp is None:
+        if mod is None:
+            mod = types.ModuleType("_pytest.runner")
+            mod.__doc__ = "ztest shim: call-boundary trampoline (freezegun parity)."
+            try:
+                sys.modules["_pytest.runner"] = mod
+                _parent = sys.modules.get("_pytest")
+                if _parent is not None and getattr(_parent, "runner", None) is None:
+                    _parent.runner = mod
+            except Exception:
+                pass
+        # A fixed source string compiled under the shim's own filename: the
+        # frame lives in the module's namespace (freezegun sees
+        # '_pytest.runner'), while failure reports strip it as runner machinery.
+        _tramp_file = globals().get("__file__") or _SHIM_BASENAME
+        exec(compile(_ZT_CALL_TRAMPOLINE_SRC, _tramp_file, "exec"), mod.__dict__)
+        tramp = mod.__dict__["_ztest_call_trampoline"]
+    _ZT_CALL_TRAMPOLINE = tramp
+    return tramp
+
+
+@contextlib.contextmanager
+def _shim_recursion_compensation(depth: int = 25) -> Any:
+    """+`depth` on sys.getrecursionlimit() for one test body, restored in finally.
+
+    astroid's recursion-guard test expects the interpreter's guard to trip at
+    pytest's stack depth; the shim's stack is shallower, so the call would
+    finish. The limit is raised right before the call and restored afterwards
+    even on exceptions — never at module level: the process-wide limit must
+    not leak between items or files.
+    """
+    prev = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(prev + depth)
+    except Exception:
+        # An unusable limit is not a test failure — run uncompensated.
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            sys.setrecursionlimit(prev)
+        except Exception:
+            pass
+
+
 class _FunctionTestCase(unittest.TestCase):
     """ADR-005: an adapter of pytest functions to TestCase — setUp drives the pytest lifecycle, tearDown — hooks + finalizers via addCleanup LIFO; state in resolver/ctx (see INVARIANTS.md)."""
 
@@ -6386,20 +6951,26 @@ class _FunctionTestCase(unittest.TestCase):
     def runTest(self) -> None:
         bound_fn = getattr(self._fn_instance, self.item.func.__name__) if self._fn_instance is not None else self.item.func
         call_kwargs = self._resolved_kwargs
-        if inspect.iscoroutinefunction(bound_fn):
-            # A coroutine body — on the resolver's runner; a swallowed SIGALRM is caught by the sticky-flag boundary. Invariants: ASYNC-FINALIZERS-ON-RESOLVER-RUNNER.
-            runner = self.resolver._ensure_runner()
-            try:
-                _fn_res = runner.run(bound_fn(**call_kwargs))
-            finally:
-                if self.ctx.budgets._fired:
-                    self.ctx.budgets.drain_runner(self.resolver, "timeout_drain:async_body")
-            self.ctx.budgets.raise_if_fired("async test body")
-            _guard_body_return(_fn_res, self)
-        else:
-            _fn_res = bound_fn(**call_kwargs)
-            self.ctx.budgets.raise_if_fired("test body")
-            _guard_body_return(_fn_res, self)
+        # The final call runs inside the recursion compensation (astroid stack
+        # depth parity) — restored in finally, i.e. also on a test failure.
+        with _shim_recursion_compensation():
+            if inspect.iscoroutinefunction(bound_fn):
+                # A coroutine body — on the resolver's runner; a swallowed SIGALRM is caught by the sticky-flag boundary. Invariants: ASYNC-FINALIZERS-ON-RESOLVER-RUNNER.
+                runner = self.resolver._ensure_runner()
+                try:
+                    _fn_res = runner.run(bound_fn(**call_kwargs))
+                finally:
+                    if self.ctx.budgets._fired:
+                        self.ctx.budgets.drain_runner(self.resolver, "timeout_drain:async_body")
+                self.ctx.budgets.raise_if_fired("async test body")
+                _guard_body_return(_fn_res, self)
+            else:
+                # Through the '_pytest.runner' trampoline (freezegun inspects the
+                # stack for a '_pytest.*' frame before it keeps the frozen clock
+                # across tests).
+                _fn_res = _ztest_call_trampoline()(bound_fn, call_kwargs)
+                self.ctx.budgets.raise_if_fired("test body")
+                _guard_body_return(_fn_res, self)
 
 
 def _resolver_teardown_unit(ctx: _FileRunCtx, resolver: FixtureResolver) -> None:
@@ -7470,6 +8041,9 @@ def _run_test_file_pytest_engine(
         rel_file = filepath.name
 
     ipc.send_event("FILE_START", file=rel_file)
+    # A native worker delegating a pytester file still carries the shim's pytest
+    # stubs in sys.modules — give them back to upstream pytest before importing.
+    _ensure_real_pytest_modules()
     try:
         import pytest as real_pytest
     except Exception as imp_exc:
@@ -7628,6 +8202,65 @@ def _run_test_file_pytest_engine(
     return 0 if bridge.failed == 0 else 1
 
 
+# Files/conftests seen so far that need pytest's own `pytester`/`testdir`
+# machinery (execnet's suite imports the self-hosting `pytester` plugin from
+# its conftest). Cached per path: a suite shares its conftests.
+_PYTESTER_SCAN_CACHE: dict[str, bool] = {}
+_PYTESTER_TOKEN_RE = re.compile(r"\b(?:pytester|testdir|runpytest|runpytest_inprocess)\b")
+
+
+def _mentions_pytester(path: Path) -> bool:
+    """Whether a source file references the pytester plugin/fixtures (cached)."""
+    key = str(path)
+    cached = _PYTESTER_SCAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    found = False
+    try:
+        found = bool(_PYTESTER_TOKEN_RE.search(path.read_text(encoding="utf-8", errors="replace")))
+    except Exception:
+        found = False
+    _PYTESTER_SCAN_CACHE[key] = found
+    return found
+
+
+def _ztest_file_needs_pytester(filepath_str: str, options: dict[str, Any]) -> bool:
+    """Whether this file has to run under real pytest (automatic pytester delegation).
+
+    The native shim has no in-process pytest for `pytester` to drive, so such a
+    file (or a conftest above it declaring `pytest_plugins = ["pytester"]`) is
+    delegated to the existing `_ZtestPytestBridgePlugin` path — transparently,
+    and only when real pytest is importable (otherwise the native engine runs
+    the file exactly as before). Opt out with ZTEST_NO_PYTESTER_DELEGATION=1.
+    """
+    if os.environ.get("ZTEST_NO_PYTESTER_DELEGATION") == "1":
+        return False
+    try:
+        raw_target = filepath_str.split("::", 1)[0] if "::" in filepath_str else filepath_str
+        filepath = Path(raw_target).resolve()
+        rootpath = Path(options.get("rootdir") or os.getcwd()).resolve()
+    except Exception:
+        return False
+    chain: list[Path] = [filepath]
+    probe = filepath.parent
+    while True:
+        chain.append(probe / "conftest.py")
+        if probe == rootpath or probe.parent == probe:
+            break
+        probe = probe.parent
+    if not any(_mentions_pytester(p) for p in chain):
+        return False
+    # Upstream pytest availability is resolved without importing it: in the
+    # native engine sys.modules['pytest'] is the shim's stub, so `import pytest`
+    # would answer the wrong question. The probe also stays cheap.
+    try:
+        if importlib.machinery.PathFinder.find_spec("pytest") is None:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def run_test_file(
     filepath_str: str,
     options: dict[str, Any],
@@ -7657,7 +8290,18 @@ def run_test_file(
         except OSError:
             _file_fd_guard = None
     try:
-        if options.get("engine") == "pytest" or os.environ.get("ZTEST_ENGINE") == "pytest":
+        # ini addopts -k/-m/--maxfail join the per-file options before either
+        # engine dispatches (poetry-core: addopts = "-m 'not integration'").
+        options = _with_ini_addopts_filters(filepath_str, options)
+        _engine = str(options.get("engine") or os.environ.get("ZTEST_ENGINE") or "native").strip()
+        if _engine == "pytest":
+            return _run_test_file_pytest_engine(filepath_str, options, ipc)
+        # The native engine's only failure mode for such a file is a missing
+        # pytester fixture, so a file that asks for pytest's pytester machinery
+        # is delegated to the real-pytest bridge. There is no `--engine=auto`
+        # CLI value: the delegation is a property of the native engine, and the
+        # explicit engine choices stay `native` and `pytest`.
+        if _engine == "native" and _ztest_file_needs_pytester(filepath_str, options):
             return _run_test_file_pytest_engine(filepath_str, options, ipc)
         return _run_test_file_impl(filepath_str, options, ipc)
     finally:
@@ -7724,6 +8368,10 @@ def _run_test_file_impl(
     # pytest reads its ini from the target's ancestor chain, so a suite run
     # from an unrelated CWD still honors its own pytest.ini/pyproject.toml.
     cfg = ConfigStub(rootpath, options=options, ini_root=_discover_ini_dir(filepath.parent) or rootpath)
+    # The active config for fixtures that delegate to installed plugins
+    # (mocker → pytest_mock.MockerFixture); one file per process.
+    global _ZT_ACTIVE_CONFIG
+    _ZT_ACTIVE_CONFIG = cfg
     parser_stub = ParserStub(cfg)
     session_stub = types.SimpleNamespace(config=cfg, items=[], exitstatus=0)
 
@@ -7874,6 +8522,27 @@ def _run_test_file_impl(
             _seen_plugins.add(name)
             return importlib.import_module(name)
 
+        # pytest11 entry-point plugins — pytest registers them before any
+        # conftest, so they go first: their fixtures stay the weakest layer,
+        # exactly like upstream. Only the project's own plugin is auto-loaded
+        # (the Bench-100 platformdirs case): importing every installed plugin
+        # would drag arbitrary third-party code into each worker under the
+        # shim's pytest stub, so the rest is opt-in via ZTEST_PYTEST11_ALL=1.
+        _pytest11_all = os.environ.get("ZTEST_PYTEST11_ALL") == "1"
+        _entrypoint_plugin_ids: set[int] = set()
+        for _ep_name, _ep_mod_name in _pytest11_entry_points():
+            if not (_pytest11_all or _entrypoint_plugin_in_project(_ep_mod_name, rootpath)):
+                continue
+            try:
+                _ep_mod = _load_plugin(_ep_mod_name)
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                continue  # a broken entry-point plugin must not take the file down
+            if _ep_mod is None:
+                continue
+            _entrypoint_plugin_ids.add(id(_ep_mod))
+            _expanded_confs.append((Path(getattr(_ep_mod, "__file__", None) or _ep_mod_name), _ep_mod))
         for _pname in _iter_plugin_names(cfg.getini("plugins")):
             _pmod = _load_plugin(_pname)
             if _pmod is not None:
@@ -7890,23 +8559,49 @@ def _run_test_file_impl(
             _expanded_confs.append((cf_path, cf_mod))
 
         for cf_path, cf_mod in _expanded_confs:
+            # A pytest11 entry-point plugin is third-party code the shim does not
+            # own: its hooks may use APIs the shim deliberately does not model
+            # (fail-closed for conftests). Such a plugin is dropped whole — with
+            # a note — instead of failing the file: no plugin is exactly the
+            # pre-existing behaviour.
+            _is_ep_plugin = id(cf_mod) in _entrypoint_plugin_ids
+            _layers_before = len(fixture_layers)
             conftest_mods.append(cf_mod)
-            # The audit and fixture extraction run per-file from the live
-            # module: cross-module fixture mutations through a foreign
-            # pytest_configure are seen at once. The audit is the single
-            # _audit_conftest_hooks helper (the explode-attr/noop/wrapper
-            # handling lives there).
-            _audit_conftest_hooks(cf_mod, cf_path)
-            _hook_addoption = _invocable_conf_hook(cf_mod, "pytest_addoption")
-            if _hook_addoption is not None:
-                _check_conf_hook_result("pytest_addoption", _call_arity_aware(_hook_addoption, parser_stub))
-            _hook_configure = _invocable_conf_hook(cf_mod, "pytest_configure")
-            if _hook_configure is not None:
-                _check_conf_hook_result("pytest_configure", _call_arity_aware(_hook_configure, cfg))
-            _hook_sessstart = _invocable_conf_hook(cf_mod, "pytest_sessionstart")
-            if _hook_sessstart is not None:
-                _check_conf_hook_result("pytest_sessionstart", _call_arity_aware(_hook_sessstart, session_stub))
-            fixture_layers.append(_extract_fixtures_from_obj(cf_mod))
+            try:
+                # The audit and fixture extraction run per-file from the live
+                # module: cross-module fixture mutations through a foreign
+                # pytest_configure are seen at once. The audit is the single
+                # _audit_conftest_hooks helper (the explode-attr/noop/wrapper
+                # handling lives there).
+                _audit_conftest_hooks(cf_mod, cf_path)
+                _hook_addoption = _invocable_conf_hook(cf_mod, "pytest_addoption")
+                if _hook_addoption is not None:
+                    _check_conf_hook_result("pytest_addoption", _call_arity_aware(_hook_addoption, parser_stub))
+                _hook_configure = _invocable_conf_hook(cf_mod, "pytest_configure")
+                if _hook_configure is not None:
+                    _check_conf_hook_result("pytest_configure", _call_arity_aware(_hook_configure, cfg))
+                _hook_sessstart = _invocable_conf_hook(cf_mod, "pytest_sessionstart")
+                if _hook_sessstart is not None:
+                    _check_conf_hook_result("pytest_sessionstart", _call_arity_aware(_hook_sessstart, session_stub))
+                fixture_layers.append(_extract_fixtures_from_obj(cf_mod))
+            except KeyboardInterrupt:
+                raise
+            except BaseException:
+                if not _is_ep_plugin:
+                    raise
+                if conftest_mods and conftest_mods[-1] is cf_mod:
+                    conftest_mods.pop()
+                del fixture_layers[_layers_before:]
+                if os.environ.get("ZTEST_DEBUG_ENTRYPOINTS") == "1":
+                    try:
+                        _ep_skip_msg = traceback.format_exc().strip().splitlines()[-1]
+                        sys.__stderr__.write(
+                            f"ztest: pytest11 plugin {getattr(cf_mod, '__name__', str(cf_path))} "
+                            f"skipped for this file: {_ep_skip_msg}\n"
+                        )
+                        sys.__stderr__.flush()
+                    except Exception:
+                        pass
 
         # pytest_ignore_collect — pluggy firstresult: hook impls go LIFO
         # (leaf-first), the first non-None decides. The hook is consulted for
@@ -8682,9 +9377,22 @@ _TB_FRAME_RE = re.compile(r'^\s+File "(?P<path>[^"]+)", line \d+, in (?P<func>.*
 # the failure.
 _CAPTURE_REPORT_CHARS = 65536
 
+# Stdlib unittest driver frames (run/testPartExecutor/_callTestMethod and the
+# result/suite plumbing) are runner machinery, not user code. When a plain
+# function test executes through the _FunctionTestCase adapter these frames
+# would otherwise dominate the rendered traceback with six lines of
+# unittest/case.py internals.
+_UNITTEST_FRAME_RE = re.compile(
+    r"(^|[\\/])unittest[\\/](case|result|suite|runner|main|loader|_log)\.py$"
+)
+
 
 def _is_shim_frame(path: str) -> bool:
     return os.path.basename(path) == _SHIM_BASENAME
+
+
+def _is_internal_runner_frame(path: str) -> bool:
+    return _is_shim_frame(path) or bool(_UNITTEST_FRAME_RE.search(path))
 
 
 def _strip_shim_frames(text: str) -> str:
@@ -8695,14 +9403,14 @@ def _strip_shim_frames(text: str) -> str:
     output. Frame blocks are the ``File "..."`` header plus the indented
     source/caret lines that belong to it.
     """
-    if _SHIM_BASENAME not in text:
+    if _SHIM_BASENAME not in text and "unittest" not in text:
         return text
     kept: list[str] = []
     dropping = False
     for line in text.splitlines():
         match = _TB_FRAME_RE.match(line)
         if match is not None:
-            dropping = _is_shim_frame(match.group("path"))
+            dropping = _is_internal_runner_frame(match.group("path"))
             if dropping:
                 continue
         elif dropping:
@@ -8731,14 +9439,14 @@ def _sanitize_frame_data(data: dict[str, Any]) -> dict[str, Any]:
     """Scrub the runner's internal paths from the textual frame fields."""
     for key in ("tb", "msg"):
         value = data.get(key)
-        if isinstance(value, str) and _SHIM_BASENAME in value:
+        if isinstance(value, str) and (_SHIM_BASENAME in value or "unittest" in value):
             data[key] = _strip_shim_frames(value)
     return data
 
 
 def _report_failure(ipc: IpcChannel, item: TestItemSpec, exc: BaseException, out_txt: str, err_txt: str, dur_ms: int, error_name: str | None = None) -> None:
     tb_entries = traceback.extract_tb(exc.__traceback__)
-    filtered = [f for f in tb_entries if not _is_shim_frame(f.filename)]
+    filtered = [f for f in tb_entries if not _is_internal_runner_frame(f.filename)]
     last_frame = filtered[-1] if filtered else (tb_entries[-1] if tb_entries else None)
     loc = f"{last_frame.filename}:{last_frame.lineno}" if last_frame else str(item.filepath)
     short_tb = "\n".join(
@@ -8893,6 +9601,9 @@ def run_zygote_server(ctrl_sock_path: str, ipc_sock_path: str, supervisor_pid: i
         _warm_ini_options_cache(cwd_path)
     except BaseException:
         pass
+    # The pytest11 entry-point list is a sys.path-wide scan; computed once in
+    # the zygote, the workers inherit it via COW instead of paying it per file.
+    _warm_pytest11_entrypoint_cache()
 
     # Return the glibc free chunks to the OS before freeze — the workers get a
     # trimmed address space via COW (see _trim_free_arenas).

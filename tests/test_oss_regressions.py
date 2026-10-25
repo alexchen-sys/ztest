@@ -2502,5 +2502,431 @@ class TestShimInternals(unittest.TestCase):
             self.assertIn("passed", parsed_b1[-1])
             self.assertEqual(parsed_b1[-1]["failed"], 45)
 
+
+    # --- CLI UX (lane B2): named unknown-flag diagnostic + short summary block ---
+
+    def test_unrecognized_argument_names_flag(self) -> None:
+        """An unknown flag must be named in the diagnostic, not swallowed by a
+        blind "invalid command-line arguments" line."""
+        proc = subprocess.run(
+            [ZTEST_BIN, "--bogus-flag"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("--bogus-flag", out)
+        self.assertIn("unrecognized argument", out)
+
+    def test_short_summary_info_block(self) -> None:
+        """One failing test in human mode: pytest-style
+        `=== short test summary info ===` block with a FAILED line before the
+        final summary."""
+        with tempfile.TemporaryDirectory(prefix="ztest-shortsum-") as td:
+            work = Path(td)
+            (work / "test_one_fail.py").write_text(
+                "def test_ok():\n"
+                "    assert True\n"
+                "\n"
+                "\n"
+                "def test_boom():\n"
+                "    assert 1 == 2\n"
+            )
+            proc = subprocess.run(
+                [ZTEST_BIN, "--python", sys.executable, "-j1", "."],
+                cwd=work,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn("=== short test summary info ===", out)
+        self.assertIn("FAILED", out)
+        self.assertIn("test_one_fail.py::test_boom", out)
+        # The block precedes the totals line.
+        block_at = out.index("=== short test summary info ===")
+        summary_at = out.index("ztest summary:")
+        self.assertLess(block_at, summary_at, out)
+
+
+class TestLaneB3ShimCallBoundary(unittest.TestCase):
+    """Bench-100 shim fixes, pinned in-process against the real shim module.
+
+    Each case runs one file through `run_test_file` (the native worker entry)
+    with a socketpair as the ZTST channel: no binary build is needed, and the
+    assertions live inside the test bodies that the shim itself executes.
+    """
+
+    SHIM_MODULE_NAME = "zshim_b3_probe"
+
+    @classmethod
+    def _import_shim(cls):
+        import importlib.util
+
+        shim_path = Path(__file__).resolve().parent.parent / "src" / "shim" / "ztest_shim.py"
+        spec = importlib.util.spec_from_file_location(cls.SHIM_MODULE_NAME, shim_path)
+        m = importlib.util.module_from_spec(spec)
+        # Registered under its own name so a plugin/conftest loaded by the shim
+        # can reach the very module under test (see the pytest11 case below).
+        sys.modules[cls.SHIM_MODULE_NAME] = m
+        spec.loader.exec_module(m)
+        return m
+
+    @staticmethod
+    def _run_native(m, root: Path, target: Path, **overrides) -> tuple[int, str]:
+        """Run one file through the native engine in-process; (rc, decoded frames)."""
+        import socket
+        import threading
+
+        opts = {
+            "rootdir": str(root),
+            "no_capture": True,
+            "engine": "native",
+            "k_expr": "",
+            "m_expr": "",
+            "maxfail": 0,
+        }
+        opts.update(overrides)
+        sock_a, sock_b = socket.socketpair()
+        ipc = m.IpcChannel(sock_a.fileno(), os.getpid())
+        chunks: list[bytes] = []
+
+        def _drain() -> None:
+            while True:
+                try:
+                    data = sock_b.recv(65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+        try:
+            rc = m.run_test_file(str(target), opts, ipc)
+        finally:
+            sock_a.close()
+            sock_b.close()
+            reader.join(timeout=10)
+        return rc, b"".join(chunks).decode("utf-8", "replace")
+
+    def test_test_call_has_pytest_runner_frame_and_astroid_compensation(self) -> None:
+        """freezegun/astroid: the test body sees a `_pytest.runner` frame and +25 recursion limit."""
+        m = self._import_shim()
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-call-") as td:
+            root = Path(td)
+            (root / "test_boundary.py").write_text(
+                "import inspect\n"
+                "import sys\n"
+                "BASE_LIMIT = sys.getrecursionlimit()\n"
+                "\n"
+                "def test_call_boundary():\n"
+                "    # The immediate caller is the trampoline: its frame's module is\n"
+                "    # '_pytest.runner', which is what freezegun's stack scan looks for\n"
+                "    # (the enclosing harness may hold other _pytest frames, so the\n"
+                "    # direct caller is the honest pin).\n"
+                "    caller = inspect.stack()[1].frame.f_globals.get('__name__')\n"
+                "    assert caller == '_pytest.runner', caller\n"
+                "    assert sys.getrecursionlimit() == BASE_LIMIT + 25, (\n"
+                "        sys.getrecursionlimit(), BASE_LIMIT)\n",
+                encoding="utf-8",
+            )
+            limit_before = sys.getrecursionlimit()
+            rc, frames = self._run_native(m, root, root / "test_boundary.py")
+            self.assertEqual(rc, 0, frames)
+            self.assertIn('"t": "TEST_PASS"', frames)
+            # finally-restore: the process-wide limit never leaks out of the item.
+            self.assertEqual(sys.getrecursionlimit(), limit_before)
+
+            # Negative control: without the trampoline the same body fails, so the
+            # pin above really observes the call boundary (and not a stray frame).
+            m._ZT_CALL_TRAMPOLINE = None
+            m._ztest_call_trampoline = lambda: (lambda fn, kwargs: fn(**kwargs))
+            rc2, frames2 = self._run_native(m, root, root / "test_boundary.py")
+            self.assertEqual(rc2, 1, frames2)
+            self.assertIn('"t": "TEST_FAIL"', frames2)
+            self.assertIn("_pytest.runner", frames2)
+            self.assertIn("test_call_boundary", frames2)
+
+    def test_addopts_marker_filter_applies_and_cli_wins(self) -> None:
+        """poetry-core: `addopts = "-m 'not integration'"` deselects integration tests; CLI -m wins."""
+        m = self._import_shim()
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-addopts-") as td:
+            root = Path(td)
+            (root / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\n"
+                'addopts = "-m \'not integration\'"\n'
+                'markers = ["integration: slow"]\n',
+                encoding="utf-8",
+            )
+            (root / "test_marks.py").write_text(
+                "import pathlib\n"
+                "import pytest\n"
+                "HERE = pathlib.Path(__file__).parent\n"
+                "\n"
+                "def test_unit():\n"
+                "    assert True\n"
+                "\n"
+                "@pytest.mark.integration\n"
+                "def test_integration():\n"
+                "    (HERE / 'INTEGRATION_RAN').write_text('ran')\n"
+                "    assert True\n",
+                encoding="utf-8",
+            )
+            rc, frames = self._run_native(m, root, root / "test_marks.py")
+            self.assertEqual(rc, 0, frames)
+            self.assertFalse(
+                (root / "INTEGRATION_RAN").exists(),
+                "addopts -m did not deselect the integration test",
+            )
+            self.assertIn('"deselected": 1', frames)
+            self.assertIn('"passed": 1', frames)
+
+            # An explicit CLI -m overrides the addopts value (pytest precedence).
+            rc2, frames2 = self._run_native(
+                m, root, root / "test_marks.py", m_expr="integration"
+            )
+            self.assertEqual(rc2, 0, frames2)
+            self.assertTrue(
+                (root / "INTEGRATION_RAN").exists(),
+                "the CLI -m selection was overridden by addopts",
+            )
+            self.assertIn('"passed": 1', frames2)
+
+            # Unit pin of the addopts tokenizer itself.
+            self.assertEqual(
+                m._addopts_selection_filters(root), ("", "not integration", 0)
+            )
+            with tempfile.TemporaryDirectory(prefix="ztest-b3-addopts2-") as td2:
+                root2 = Path(td2)
+                (root2 / "pyproject.toml").write_text(
+                    '[tool.pytest.ini_options]\naddopts = "-k fast --maxfail=3 -x"\n',
+                    encoding="utf-8",
+                )
+                # -x (maxfail=1) comes last, so it wins over --maxfail=3.
+                self.assertEqual(m._addopts_selection_filters(root2), ("fast", "", 1))
+            # A separate root: the ini-options cache is keyed by directory.
+            with tempfile.TemporaryDirectory(prefix="ztest-b3-addopts3-") as td3:
+                root3 = Path(td3)
+                (root3 / "pyproject.toml").write_text(
+                    '[tool.pytest.ini_options]\naddopts = "-kfast --maxfail 2"\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(m._addopts_selection_filters(root3), ("fast", "", 2))
+
+    def test_mocker_fixture_delegates_to_installed_pytest_mock(self) -> None:
+        """platformdirs: `mocker` resolves to pytest-mock's MockerFixture when installed."""
+        m = self._import_shim()
+        import types as _types
+
+        class _FakeMocker:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.args = args
+                self.patched: list[str] = []
+
+            def patch(self, target: str, *a: object, **kw: object) -> None:
+                self.patched.append(target)
+
+            def stopall(self) -> None:
+                self.patched.clear()
+
+            def resetall(self) -> None:
+                pass
+
+        fake_plugin = _types.ModuleType("pytest_mock.plugin")
+        fake_plugin.MockerFixture = _FakeMocker  # type: ignore[attr-defined]
+        fake_pkg = _types.ModuleType("pytest_mock")
+        fake_pkg.plugin = fake_plugin  # type: ignore[attr-defined]
+        saved = {n: sys.modules.get(n) for n in ("pytest_mock", "pytest_mock.plugin")}
+        sys.modules["pytest_mock"] = fake_pkg
+        sys.modules["pytest_mock.plugin"] = fake_plugin
+        try:
+            with tempfile.TemporaryDirectory(prefix="ztest-b3-mocker-") as td:
+                root = Path(td)
+                (root / "test_mock.py").write_text(
+                    "def test_mocker(mocker):\n"
+                    "    assert type(mocker).__name__ == '_FakeMocker', type(mocker).__name__\n"
+                    "    mocker.patch('os.getcwd')\n"
+                    "    assert mocker.patched == ['os.getcwd']\n",
+                    encoding="utf-8",
+                )
+                rc, frames = self._run_native(m, root, root / "test_mock.py")
+                self.assertEqual(rc, 0, frames)
+                self.assertIn('"t": "TEST_PASS"', frames)
+        finally:
+            for name, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+        # Without pytest-mock the built-in stub still serves the fixture.
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-mocker2-") as td:
+            root2 = Path(td)
+            (root2 / "test_mock_stub.py").write_text(
+                "import os\n"
+                "\n"
+                "def test_stub(mocker):\n"
+                "    assert type(mocker).__name__ == 'MockerFixture'\n"
+                "    mocker.patch('os.getcwd', return_value='/stub')\n"
+                "    assert os.getcwd() == '/stub'\n",
+                encoding="utf-8",
+            )
+            rc, frames = self._run_native(m, root2, root2 / "test_mock_stub.py")
+            self.assertEqual(rc, 0, frames)
+
+    def test_pytest11_entrypoint_plugin_fixtures_are_registered(self) -> None:
+        """platformdirs: a pytest11 entry-point plugin's fixtures resolve under the native engine."""
+        m = self._import_shim()
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-ep-") as td:
+            root = Path(td)
+            # The plugin registers with the shim's own fixture decorator: the
+            # worker's `pytest` module is the shim's stub, which is what an
+            # in-project plugin sees in a real run.
+            (root / "local_pytest_plugin.py").write_text(
+                f"import {self.SHIM_MODULE_NAME} as _shim\n"
+                "\n"
+                "@_shim.fixture\n"
+                "def from_entrypoint():\n"
+                "    return 'entrypoint-value'\n",
+                encoding="utf-8",
+            )
+            (root / "test_ep.py").write_text(
+                "def test_uses_entrypoint_fixture(from_entrypoint):\n"
+                "    assert from_entrypoint == 'entrypoint-value'\n",
+                encoding="utf-8",
+            )
+            original = m._pytest11_entry_points
+            m._pytest11_entry_points = lambda: [("localproj", "local_pytest_plugin")]
+            try:
+                rc, frames = self._run_native(m, root, root / "test_ep.py")
+            finally:
+                m._pytest11_entry_points = original
+            self.assertEqual(rc, 0, frames)
+            self.assertIn('"t": "TEST_PASS"', frames)
+
+            # Negative control: without the entry-point list the fixture is missing.
+            rc2, frames2 = self._run_native(m, root, root / "test_ep.py")
+            self.assertEqual(rc2, 1, frames2)
+            self.assertIn("fixture 'from_entrypoint' not found", frames2)
+            self.assertIn('"t": "TEST_FAIL"', frames2)
+
+            # The environment's own entry points are enumerated, minus the
+            # plugins that would fight the supervisor (xdist/cov/sugar/html).
+            eps = m._pytest11_entry_points()
+            self.assertIsInstance(eps, list)
+            for name, module_name in eps:
+                for hint in ("xdist", "cov", "sugar", "html"):
+                    self.assertNotIn(hint, name.lower())
+                self.assertNotIn(":", module_name)
+
+    def test_pytester_files_are_detected_for_bridge_delegation(self) -> None:
+        """execnet: a file (or conftest) asking for `pytester` is delegated to the pytest bridge."""
+        m = self._import_shim()
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-pyt-") as td:
+            root = Path(td)
+            (root / "testing").mkdir()
+            (root / "testing" / "conftest.py").write_text(
+                'pytest_plugins = ["pytester"]\n', encoding="utf-8"
+            )
+            (root / "testing" / "test_sub.py").write_text(
+                "def test_uses_pytester(pytester):\n"
+                "    pytester.makepyfile('def test_x(): assert True')\n",
+                encoding="utf-8",
+            )
+            (root / "test_plain.py").write_text(
+                "def test_plain():\n    assert True\n", encoding="utf-8"
+            )
+            self.assertTrue(
+                m._ztest_file_needs_pytester(
+                    str(root / "testing" / "test_sub.py"), {"rootdir": str(root)}
+                )
+            )
+            self.assertFalse(
+                m._ztest_file_needs_pytester(
+                    str(root / "test_plain.py"), {"rootdir": str(root)}
+                )
+            )
+            saved = os.environ.get("ZTEST_NO_PYTESTER_DELEGATION")
+            os.environ["ZTEST_NO_PYTESTER_DELEGATION"] = "1"
+            try:
+                self.assertFalse(
+                    m._ztest_file_needs_pytester(
+                        str(root / "testing" / "test_sub.py"), {"rootdir": str(root)}
+                    )
+                )
+            finally:
+                if saved is None:
+                    os.environ.pop("ZTEST_NO_PYTESTER_DELEGATION", None)
+                else:
+                    os.environ["ZTEST_NO_PYTESTER_DELEGATION"] = saved
+
+
+    def test_bridge_restores_upstream_pytest_after_stub_install(self) -> None:
+        """execnet/pytester: the bridge gets upstream pytest, not the shim's stub.
+
+        The native engine installs the shim's pytest stubs process-wide; the
+        pytester delegation runs the file through real pytest, so the stub
+        entries have to be handed back first. Checked in a subprocess: it
+        rewrites sys.modules['pytest'] for the whole interpreter.
+        """
+        shim_path = Path(__file__).resolve().parent.parent / "src" / "shim" / "ztest_shim.py"
+        code = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('zs_probe', {str(shim_path)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "m.install_pytest_modules()\n"
+            "stub = sys.modules['pytest']\n"
+            "print('STUB_IS_SHIM', stub is not None)\n"
+            "m._ensure_real_pytest_modules()\n"
+            "import pytest\n"
+            "print('UPSTREAM', pytest is not stub)\n"
+            "print('HAS_MAIN', callable(getattr(pytest, 'main', None)))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STUB_IS_SHIM True", proc.stdout)
+        self.assertIn("UPSTREAM True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("HAS_MAIN True", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_pytest11_fast_scan_reads_dist_metadata(self) -> None:
+        """platformdirs: the hand metadata scan finds pytest11 entry points without importlib.metadata."""
+        m = self._import_shim()
+        with tempfile.TemporaryDirectory(prefix="ztest-b3-dist-") as td:
+            site = Path(td)
+            dist_info = site / "pplocal-1.0.dist-info"
+            dist_info.mkdir()
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: pplocal\nVersion: 1.0\n", encoding="utf-8"
+            )
+            (dist_info / "entry_points.txt").write_text(
+                "[pytest11]\npplocal = local_pytest_plugin\n"
+                "[console_scripts]\npplocal-cli = pplocal:main\n",
+                encoding="utf-8",
+            )
+            # A distribution without entry_points.txt and a skipped plugin name.
+            (site / "other-2.0.dist-info").mkdir()
+            (site / "pytest_cov-9.9.dist-info").mkdir()
+            (site / "pytest_cov-9.9.dist-info" / "entry_points.txt").write_text(
+                "[pytest11]\ncov = pytest_cov.plugin\n", encoding="utf-8"
+            )
+            sys.path.insert(0, str(site))
+            try:
+                found = m._scan_pytest11_entry_points_fast()
+            finally:
+                sys.path.remove(str(site))
+            self.assertIn(("pplocal", "local_pytest_plugin"), found, found)
+            self.assertNotIn("cov", [name for name, _ in found])
+            for _name, _mod in found:
+                self.assertNotIn(":", _mod)
+
+
+
 if __name__ == "__main__":
     unittest.main()

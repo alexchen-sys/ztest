@@ -1443,6 +1443,231 @@ pub fn frameBudgetMs(worker_read_timeout_ms: i64, prog: FrameProgress) i64 {
     return if (prog == .file_start) @max(worker_read_timeout_ms, FILE_START_BUDGET_MS) else worker_read_timeout_ms;
 }
 
+// ============================================================================
+// Session-wide short test summary info
+// ============================================================================
+// The human summary ends with pytest's `=== short test summary info ===`
+// block: one `FAILED <nodeid> - <reason>` line per failed test, printed before
+// the final summary line. Records are collected from TEST_FAIL frames as they
+// stream in, so the block is already complete when a later file crashes. The
+// storage is a bounded static ring because the frame loop's step arena is
+// reset every iteration — nothing allocated there may survive it.
+//
+// Bounded storage must not lie about what it holds, so three properties are
+// explicit rather than incidental:
+//   * dedup keys are 128-bit hashes of the FULL nodeid (plus its length), never
+//     the truncated display text, so two long nodeids that share a 512-byte
+//     prefix stay two records;
+//   * a nodeid or reason that does not fit its display buffer keeps a UTF-8-safe
+//     prefix and gets a `…` marker, so truncation is visible in the line;
+//   * failures that arrive after the ring fills are counted and reported as
+//     `... N more failed-test reports not shown`. That number counts records,
+//     not unique tests: proving uniqueness past the ring would need unbounded
+//     storage (or a second ring whose eviction makes the count wrong again), so
+//     the line claims exactly what is known. The block never looks complete
+//     when it is not.
+pub const MAX_SUMMARY_FAILS: usize = 256;
+pub const SUMMARY_NODEID_MAX: usize = 512;
+pub const SUMMARY_REASON_MAX: usize = 120;
+
+pub const FailedTestNote = struct { nodeid: []const u8, reason: []const u8 };
+
+/// Dedup key for one failed test: two 64-bit FNV-1a passes over the full nodeid
+/// (one forward, one over the reversed bytes with a different basis) plus the
+/// byte length. 128 bits of identity: a collision would have to agree on both
+/// passes and the length, and only ever merges two display lines — it never
+/// inflates or deflates the run's counters.
+pub const NodeIdIdentity = struct { h1: u64, h2: u64, len: usize };
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_ALT_BASIS: u64 = 0x9e3779b97f4a7c15;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn fnv1a64(seed: u64, bytes: []const u8, reverse: bool) u64 {
+    var h: u64 = seed;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        const b = if (reverse) bytes[bytes.len - 1 - i] else bytes[i];
+        h ^= b;
+        h *%= FNV_PRIME;
+    }
+    return h;
+}
+
+pub fn nodeIdIdentity(nodeid: []const u8) NodeIdIdentity {
+    return .{
+        .h1 = fnv1a64(FNV_OFFSET_BASIS, nodeid, false),
+        .h2 = fnv1a64(FNV_ALT_BASIS, nodeid, true),
+        .len = nodeid.len,
+    };
+}
+
+fn identityEq(a: NodeIdIdentity, b: NodeIdIdentity) bool {
+    return a.h1 == b.h1 and a.h2 == b.h2 and a.len == b.len;
+}
+
+/// Copies `text` into `buf`, or its longest UTF-8-safe prefix plus a `…` marker
+/// when it does not fit. The marker shares the buffer, so the result is always
+/// at most `buf.len` bytes and never ends mid-codepoint.
+fn fitWithEllipsis(text: []const u8, buf: []u8) []const u8 {
+    if (text.len <= buf.len) {
+        @memcpy(buf[0..text.len], text[0..text.len]);
+        return buf[0..text.len];
+    }
+    var n: usize = buf.len - 3; // room for the 3-byte U+2026 ellipsis
+    while (n > 0 and (text[n] & 0xC0) == 0x80) n -= 1; // do not split a codepoint
+    @memcpy(buf[0..n], text[0..n]);
+    buf[n] = 0xE2; // U+2026 HORIZONTAL ELLIPSIS, written byte-wise so the buffer
+    buf[n + 1] = 0x80; // arithmetic stays explicit (no UTF-8 slicing tricks)
+    buf[n + 2] = 0xA6;
+    return buf[0..n + 3];
+}
+
+var g_failed_notes: [MAX_SUMMARY_FAILS]FailedTestNote = undefined;
+var g_failed_ident: [MAX_SUMMARY_FAILS]NodeIdIdentity = undefined;
+var g_failed_note_count: usize = 0;
+var g_failed_nodeid_buf: [MAX_SUMMARY_FAILS][SUMMARY_NODEID_MAX]u8 = undefined;
+var g_failed_reason_buf: [MAX_SUMMARY_FAILS][SUMMARY_REASON_MAX]u8 = undefined;
+
+/// Failure records that arrived after the display ring filled up. Saturating so
+/// a pathological run cannot wrap the counter; the printed wording calls them
+/// *reports*, never "unique tests".
+var g_failed_omitted_reports: u64 = 0;
+
+/// Drops the records of a previous run (unit tests re-enter the frame parser).
+pub fn resetFailedTestNotes() void {
+    g_failed_note_count = 0;
+    g_failed_omitted_reports = 0;
+}
+
+pub fn failedTestNoteCount() usize {
+    return g_failed_note_count;
+}
+
+/// Failure reports that did not fit the display ring. A repeated report of an
+/// unlisted failure counts again — this is a record count, not a unique-test
+/// count, and the printed line says so.
+pub fn failedTestOmittedReports() u64 {
+    return g_failed_omitted_reports;
+}
+
+pub fn failedTestNotes() []const FailedTestNote {
+    return g_failed_notes[0..g_failed_note_count];
+}
+
+fn isDecorativeRule(line: []const u8) bool {
+    if (line.len == 0) return true;
+    for (line) |ch| {
+        if (ch != '-' and ch != '=' and ch != '_') return false;
+    }
+    return true;
+}
+
+/// Last non-empty, non-decorative line of a traceback/failure report. For a
+/// Python traceback that is the `SomeError: message` line pytest itself puts
+/// in its short summary; the `_____ test_name _____` headers of a failure
+/// report are rules and never qualify.
+fn lastMeaningfulLine(text: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var found: ?[]const u8 = null;
+    while (it.next()) |raw| {
+        const ln = std.mem.trimEnd(u8, raw, " \t\r");
+        if (isDecorativeRule(ln)) continue;
+        found = std.mem.trimStart(u8, ln, " \t");
+    }
+    return found;
+}
+
+/// First line of `text` that opens with the exception class name — for a Python
+/// traceback that is the `AssertionError: assert 1 == 2` line, even when the
+/// exception message itself spans several lines (then the LAST line of the
+/// traceback is just a continuation like `Right: 2` and must not be picked).
+fn namedErrorLine(text: []const u8, err_name: []const u8) ?[]const u8 {
+    if (err_name.len == 0) return null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        var ln = std.mem.trim(u8, raw, " \t\r");
+        // pytest's exception-report lines carry an "E   " gutter.
+        if (ln.len > 2 and ln[0] == 'E' and ln[1] == ' ') ln = std.mem.trimStart(u8, ln[1..], " ");
+        if (ln.len != 0 and std.mem.startsWith(u8, ln, err_name)) return ln;
+    }
+    return null;
+}
+
+/// One-line reason for the short summary block: the `Error: message` line when
+/// the failure text has one, else the last meaningful line, else the class name.
+pub fn shortFailReason(err_name: []const u8, msg: []const u8, tb: []const u8) []const u8 {
+    if (namedErrorLine(tb, err_name)) |ln| return ln;
+    if (namedErrorLine(msg, err_name)) |ln| return ln;
+    if (lastMeaningfulLine(tb)) |ln| return ln;
+    if (lastMeaningfulLine(msg)) |ln| return ln;
+    if (err_name.len != 0) return err_name;
+    return "failed";
+}
+
+/// Records one failed test. The dedup key is the 128-bit identity of the FULL
+/// nodeid, so a failure re-reported by a teardown phase never yields two lines
+/// while two distinct long nodeids that share a display prefix stay distinct.
+pub fn recordFailedTest(nodeid: []const u8, reason: []const u8) void {
+    if (nodeid.len == 0) return;
+    const ident = nodeIdIdentity(nodeid);
+    for (g_failed_ident[0..g_failed_note_count]) |seen| {
+        if (identityEq(seen, ident)) return;
+    }
+    if (g_failed_note_count >= MAX_SUMMARY_FAILS) {
+        // Display ring full: count the record instead of dropping it silently.
+        // A repeat of a *listed* nodeid was already collapsed above; a repeat of
+        // an unlisted one counts again, because proving uniqueness past the ring
+        // needs unbounded storage. The printed line therefore says "reports".
+        g_failed_omitted_reports +|= 1;
+        return;
+    }
+    const slot = g_failed_note_count;
+    const nid_view = fitWithEllipsis(nodeid, g_failed_nodeid_buf[slot][0..]);
+    const trimmed = std.mem.trim(u8, reason, " \t\r");
+    const why_view = fitWithEllipsis(trimmed, g_failed_reason_buf[slot][0..]);
+    g_failed_notes[slot] = .{
+        .nodeid = nid_view,
+        .reason = why_view,
+    };
+    g_failed_ident[slot] = ident;
+    g_failed_note_count += 1;
+}
+
+/// The `=== short test summary info ===` block. Not printed at all when no test
+/// failed — a clean run keeps its one-line summary. When the display ring is
+/// full, a trailing line states how many failures are not listed, so a partial
+/// block cannot be mistaken for a complete one.
+pub fn printShortTestSummary() void {
+    if (g_failed_note_count == 0 and g_failed_omitted_reports == 0) return;
+    writeStdout("=== short test summary info ===\n");
+    var line_buf: [1024]u8 = undefined;
+    for (g_failed_notes[0..g_failed_note_count]) |note| {
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            "{s}FAILED{s} {s} - {s}\n",
+            .{ cRed(), cReset(), note.nodeid, note.reason },
+        ) catch continue;
+        writeStdout(line);
+    }
+    if (g_failed_omitted_reports != 0) {
+        var tail_buf: [160]u8 = undefined;
+        if (omittedSummaryLine(&tail_buf)) |tail| writeStdout(tail);
+    }
+}
+
+/// The line that makes a truncated summary honest: how many failure records are
+/// not listed. Deliberately not phrased as a count of unique tests — the ring
+/// cannot know that, and a wrong "at least N" would be worse than no number.
+fn omittedSummaryLine(buf: []u8) ?[]const u8 {
+    const line: ?[]const u8 = std.fmt.bufPrint(
+        buf,
+        "... {d} more failed-test reports not shown (summary lists the first {d})\n",
+        .{ g_failed_omitted_reports, g_failed_note_count },
+    ) catch null;
+    return line;
+}
+
 /// Parses one worker frame and applies it to the summary.
 /// Returns the frame's progress classification so the caller can re-arm the per-test inactivity
 /// deadline with the right budget (heartbeat semantics:
@@ -1519,6 +1744,10 @@ pub fn parseAndApplyFrameJson(
             const err_name = jsonGetString(root, "error", "AssertionError");
             const msg = jsonGetString(root, "msg", "");
             const tb = jsonGetString(root, "tb", "");
+            // Human mode: remember the failure for the `=== short test summary
+            // info ===` block. The reason is one line by construction, so the
+            // block stays a scannable index of what broke.
+            if (!llm_mode) recordFailedTest(nid, shortFailReason(err_name, msg, tb));
             if (llm_mode) {
                 if (std.fmt.allocPrint(
                     a,
@@ -2522,40 +2751,53 @@ fn runMain(init: std.process.Init) !u8 {
 
     const cli = parseCliArgs(gpa, args, &targets) catch |err| {
         if (err == error.UsageError) {
-            writeStderr("ztest: invalid command-line arguments (see --help)\n");
+            // Name the offending token when the parser identified one; a usage
+            // error that is not about a single argument keeps the generic line.
+            if (climod.last_bad_arg) |bad| {
+                var ubuf: [1024]u8 = undefined;
+                const msg = std.fmt.bufPrint(&ubuf, "ztest: unrecognized argument '{s}' (see --help)\n", .{bad}) catch
+                    "ztest: invalid command-line arguments (see --help)\n";
+                writeStderr(msg);
+            } else {
+                writeStderr("ztest: invalid command-line arguments (see --help)\n");
+            }
         }
         return err;
     };
 
     if (cli.show_help) {
         writeStdout(
-            \\ztest 0.5.0 (Zig 0.17.0) — hermetic test supervisor for Python (pytest-compatible)
+            \\ztest 0.5.1 (Zig 0.17.0) — hermetic test supervisor for Python (pytest-compatible)
             \\Usage: ztest [options] [file_or_dir] [...]
             \\Options:
-            \\  -k <expr>           Filter tests by substring/boolean expression
-            \\  -m <expr>           Filter tests by marker expression
-            \\  -x, --exitfirst     Stop on first failure
-            \\  --maxfail=<N>       Stop after N failures
-            \\  --timeout=<sec>     Per-test & supervisor hardware timeout in seconds (0 < sec <= 86400)
-            \\  --llm               JSONL machine-readable output mode
-            \\  --engine=native|pytest Test execution engine (default: native)
-            \\  --mode=zygote|exec  Execution mode (default: zygote)
-            \\  --preload=<list>    Comma-separated modules to pre-import into the zygote (opt-in)
-            \\  --python=<path>     Explicit Python 3.11+ interpreter path
-            \\  --collect-only, --co Only collect and print test nodeids
-            \\  -s, --no-capture    Disable stdout/stderr capture
-            \\  -v, -q              Verbose or quiet output
-            \\  -j, -n <N>          Parallel workers, 1 to 64 (clamped to 16, default 4)
-            \\  -V, --version       Print version
-            \\  -h, --help          Show this usage
+            \\  -k <expr>               Filter tests by substring/boolean expression
+            \\  -m <expr>               Filter tests by marker expression
+            \\  -x, --exitfirst         Stop on first failure
+            \\  --maxfail=<N>           Stop after N failures
+            \\  --timeout=<sec>         Per-test & supervisor hardware timeout in seconds (0 < sec <= 86400)
+            \\  --llm                   JSONL machine-readable output mode
+            \\  --engine=native|pytest  Test execution engine (default: native)
+            \\  --mode=zygote|exec      Execution mode (default: zygote)
+            \\  --preload=<list>        Comma-separated modules to pre-import into the zygote (opt-in)
+            \\  --python=<path>         Explicit Python 3.11+ interpreter path
+            \\  --collect-only, --co    Only collect and print test nodeids
+            \\  -s, --no-capture        Disable stdout/stderr capture
+            \\  -v, -q                  Verbose or quiet output
+            \\  -j, -n <N>              Parallel workers, 1 to 64 (clamped to 16, default 4)
+            \\  -V, --version           Print version
+            \\  -h, --help              Show this usage
             \\
         );
         return ExitCode.ok.toU8();
     }
     if (cli.show_version) {
-        writeStdout("ztest 0.5.0 (Zig 0.17.0)\n");
+        writeStdout("ztest 0.5.1 (Zig 0.17.0)\n");
         return ExitCode.ok.toU8();
     }
+
+    // Fresh short-summary accumulator per run (the process may re-enter runMain
+    // in tests; a stale record would leak into an unrelated summary).
+    resetFailedTestNotes();
 
     var engine_pytest = cli.engine_pytest;
     if (!cli.engine_explicit) {
@@ -2749,13 +2991,14 @@ fn runMain(init: std.process.Init) !u8 {
         initialized_slots += 1;
     }
 
-    // $VIRTUAL_ENV and $PATH are read once here (libc getenv) and passed
-    // down, so the resolution logic stays unit-testable without mutating the
-    // process env.
+    // $VIRTUAL_ENV and $PATH are read once here from the process environment
+    // map and passed down, so the resolution logic stays unit-testable without
+    // mutating the process env. Reading via `init.environ_map` (not libc
+    // getenv) keeps the binary free of libc, so musl targets link statically.
     var venv_buf: [4096]u8 = undefined;
     var path_buf: [4096]u8 = undefined;
-    const venv_env: ?[]const u8 = if (std.c.getenv("VIRTUAL_ENV")) |v| std.mem.span(v) else null;
-    const path_env: ?[]const u8 = if (std.c.getenv("PATH")) |v| std.mem.span(v) else null;
+    const venv_env: ?[]const u8 = init.environ_map.get("VIRTUAL_ENV");
+    const path_env: ?[]const u8 = init.environ_map.get("PATH");
     const py_bin = findPythonBinary(io, cli.explicit_py, venv_env, path_env, &venv_buf, &path_buf);
     const sup_pid_str = try std.fmt.allocPrint(gpa, "{d}", .{sup_pid});
     defer gpa.free(sup_pid_str);
@@ -3685,6 +3928,9 @@ fn runMain(init: std.process.Init) !u8 {
             " (1 collection error — file not run)"
         else
             std.fmt.bufPrint(&ce_buf, " ({d} collection errors — files not run)", .{total_collection_errors}) catch "";
+        // pytest parity: the index of failed tests comes first, then a blank
+        // line, then the one-line totals.
+        printShortTestSummary();
         const line = try std.fmt.allocPrint(
             gpa,
             "\n{s}ztest summary:{s} {d} passed, {d} failed{s}, {d} skipped, {d} deselected in {d}ms (Zig 0.17.0 {s})\n",
@@ -5559,6 +5805,57 @@ test "crash accounting folds the per-test frames and keeps the collected count" 
     foldFrameTallies(&done);
     try std.testing.expectEqual(@as(u32, 1), done.passed);
     try std.testing.expectEqual(@as(u32, 1), done.failed);
+
+    // The human short summary is a bounded ring, and bounded storage has to be
+    // honest about it. Dedup identity comes from the FULL nodeid (128-bit hash +
+    // length), display truncation is marked, and failures past the cap are
+    // counted instead of vanishing.
+    defer resetFailedTestNotes();
+
+    resetFailedTestNotes();
+    var long_a: [SUMMARY_NODEID_MAX + 8]u8 = undefined;
+    @memset(long_a[0..], 'a');
+    var long_b = long_a;
+    long_b[long_b.len - 1] = 'b'; // same 512-byte display prefix, different tail
+    recordFailedTest(long_a[0..], "first");
+    recordFailedTest(long_b[0..], "second");
+    try std.testing.expectEqual(@as(usize, 2), failedTestNoteCount());
+    const noted = failedTestNotes();
+    try std.testing.expectEqual(@as(usize, SUMMARY_NODEID_MAX), noted[0].nodeid.len);
+    try std.testing.expect(std.mem.endsWith(u8, noted[0].nodeid, "…"));
+    try std.testing.expect(!std.mem.eql(u8, noted[0].nodeid, long_a[0..]));
+    recordFailedTest(long_a[0..], "re-reported by teardown");
+    try std.testing.expectEqual(@as(usize, 2), failedTestNoteCount());
+
+    // Oversized reasons are truncated with the same visible marker.
+    resetFailedTestNotes();
+    var long_reason: [SUMMARY_REASON_MAX + 10]u8 = undefined;
+    @memset(long_reason[0..], 'r');
+    recordFailedTest("t.py::reason", long_reason[0..]);
+    try std.testing.expectEqual(@as(usize, SUMMARY_REASON_MAX), failedTestNotes()[0].reason.len);
+    try std.testing.expect(std.mem.endsWith(u8, failedTestNotes()[0].reason, "…"));
+
+    // Fill the ring, then prove overflow is counted per distinct nodeid.
+    resetFailedTestNotes();
+    var id_buf: [32]u8 = undefined;
+    var n: usize = 0;
+    while (n < MAX_SUMMARY_FAILS) : (n += 1) {
+        const nid = std.fmt.bufPrint(&id_buf, "t.py::case{d}", .{n}) catch unreachable;
+        recordFailedTest(nid, "boom");
+    }
+    try std.testing.expectEqual(MAX_SUMMARY_FAILS, failedTestNoteCount());
+    try std.testing.expectEqual(@as(u64, 0), failedTestOmittedReports());
+    recordFailedTest("t.py::overflow-1", "boom");
+    recordFailedTest("t.py::overflow-2", "boom");
+    // An unlisted failure re-reported is another *record*: the block says
+    // "reports not shown", so it must not pretend to know unique counts.
+    recordFailedTest("t.py::overflow-2", "boom");
+    try std.testing.expectEqual(@as(u64, 3), failedTestOmittedReports());
+    try std.testing.expectEqual(MAX_SUMMARY_FAILS, failedTestNoteCount());
+    // A repeat of a failure that IS listed still collapses onto its first line.
+    recordFailedTest("t.py::case0", "boom again");
+    try std.testing.expectEqual(@as(u64, 3), failedTestOmittedReports());
+    try std.testing.expectEqualStrings("boom", failedTestNotes()[0].reason);
 }
 
 test "interrupt tallies mirror a completed session summary" {

@@ -177,6 +177,20 @@ pub fn validFilterExpr(expr: []const u8) bool {
     if (!parseFilterOr(trimmed, &pos)) return false;
     return nextFilterToken(trimmed, &pos) == null;
 }
+/// The offending argument of the last usage error, when the error is tied to
+/// one specific token. `main` reads it in the `error.UsageError` catch to name
+/// the flag (`ztest: unrecognized argument '--bogus'`) instead of a blind
+/// "invalid command-line arguments"; `null` keeps the generic message for
+/// usage errors that are not about a single argument.
+pub var last_bad_arg: ?[]const u8 = null;
+
+/// Records `arg` as the offending token and yields `error.UsageError`, so every
+/// rejection site stays a one-liner.
+fn badArg(arg: []const u8) error{UsageError} {
+    last_bad_arg = arg;
+    return error.UsageError;
+}
+
 pub const ParsedCli = struct {
     k_expr: []const u8 = "",
     m_expr: []const u8 = "",
@@ -216,6 +230,12 @@ pub fn parseCliArgs(
     var cli: ParsedCli = .{};
     var i: usize = 1;
     var positional_only = false;
+
+    // The offending token belongs to THIS parse: a usage error that is not tied
+    // to one argument must not report the token a previous invocation left
+    // behind (unit tests re-enter the parser in one process; a hostile caller
+    // could do the same).
+    last_bad_arg = null;
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -277,7 +297,7 @@ pub fn parseCliArgs(
                 cli.exec_mode = false;
                 cli.mode_explicit = true;
             } else {
-                return error.UsageError;
+                return badArg(args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--engine=native")) {
             cli.engine_pytest = false;
@@ -286,7 +306,7 @@ pub fn parseCliArgs(
             cli.engine_pytest = true;
             cli.engine_explicit = true;
         } else if (std.mem.startsWith(u8, arg, "--engine=")) {
-            return error.UsageError;
+            return badArg(arg);
         } else if (std.mem.eql(u8, arg, "--engine")) {
             if (i + 1 >= args.len) return error.UsageError;
             i += 1;
@@ -297,7 +317,7 @@ pub fn parseCliArgs(
                 cli.engine_pytest = true;
                 cli.engine_explicit = true;
             } else {
-                return error.UsageError;
+                return badArg(args[i]);
             }
         } else if (std.mem.startsWith(u8, arg, "--python=")) {
             const py = arg["--python=".len..];
@@ -353,7 +373,9 @@ pub fn parseCliArgs(
             if (i + 1 >= args.len) return error.UsageError;
             i += 1;
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            return error.UsageError;
+            // Unrecognized flag spelling: name it (cli.last_bad_arg) so the
+            // supervisor can print "unrecognized argument '--bogus'".
+            return badArg(arg);
         } else {
             try targets.append(gpa, arg);
         }
@@ -501,4 +523,44 @@ test "--preload parses a comma-separated module list and rejects malformed value
     try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &bad_eng, &targets));
     const bad_eng_trailing = [_][]const u8{ "ztest", "--engine" };
     try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &bad_eng_trailing, &targets));
+}
+
+test "an unrecognized flag is reported by name via last_bad_arg" {
+    const alloc = std.testing.allocator;
+    var targets: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer targets.deinit(alloc);
+
+    // Unknown flag spelling: the token itself is remembered so the supervisor
+    // can print `unrecognized argument '--bogus-flag'`.
+    last_bad_arg = null;
+    const bogus = [_][]const u8{ "ztest", "--bogus-flag", "tests" };
+    try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &bogus, &targets));
+    try std.testing.expectEqualStrings("--bogus-flag", last_bad_arg.?);
+    try std.testing.expectEqual(@as(usize, 0), targets.items.len);
+
+    // A `--mode=` / `--engine=` token with an unknown value is not a valid
+    // spelling either, so it is named too.
+    last_bad_arg = null;
+    const bad_mode = [_][]const u8{ "ztest", "--mode=nope" };
+    try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &bad_mode, &targets));
+    try std.testing.expectEqualStrings("--mode=nope", last_bad_arg.?);
+
+    // A clean parse leaves no offending token behind (main then prints no
+    // "unrecognized argument" line at all).
+    last_bad_arg = null;
+    const ok_args = [_][]const u8{ "ztest", "-k", "a or b", "--engine=native", "tests" };
+    _ = try parseCliArgs(alloc, &ok_args, &targets);
+    try std.testing.expect(last_bad_arg == null);
+
+    // Every parse owns its offending token: a usage error that is not tied to
+    // one argument (here `--timeout=inf`) must not resurrect the token the
+    // previous parse in the same process remembered.
+    last_bad_arg = null;
+    const first_bad = [_][]const u8{ "ztest", "--bogus-flag" };
+    try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &first_bad, &targets));
+    try std.testing.expectEqualStrings("--bogus-flag", last_bad_arg.?);
+    targets.clearRetainingCapacity();
+    const then_untokened = [_][]const u8{ "ztest", "--timeout=inf" };
+    try std.testing.expectError(error.UsageError, parseCliArgs(alloc, &then_untokened, &targets));
+    try std.testing.expect(last_bad_arg == null);
 }

@@ -1,6 +1,64 @@
 # ztest
 
-A process-supervised Python test runner for the common pytest subset (Linux).
+Process-supervised Python test runner in Zig: `pidfd`/`killpg` containment, a
+Zygote worker pool, 2.6× lower memory than `pytest-xdist`, `--llm` JSONL for AI
+agents.
+
+## Install in 1 second
+
+```sh
+pip install ztest-runner                  # PyPI wheel, no toolchain
+uvx --from ztest-runner ztest --version   # zero-install, one command
+```
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/alexchen-sys/ztest/main/scripts/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/alexchen-sys/ztest/main/scripts/install.sh | sh -s -- --system
+```
+
+Prebuilt static `musl` binaries (stripped, `x86_64` and `aarch64`) sit on
+[GitHub Releases](https://github.com/alexchen-sys/ztest/releases) if you would
+rather not pipe a shell script; the installer verifies `SHA256SUMS` and honors
+`ZTEST_VERSION` / `ZTEST_INSTALL_DIR`. `ztest --version` prints
+`ztest 0.5.1 (Zig 0.17.0)`. Building from source needs Zig 0.17.0 and is
+covered at the end of this file.
+
+## Why ztest
+
+### 1. For AI agents: `ztest --llm`
+
+`pytest` starts in 600–900 ms and hands an agent 5,000–25,000 tokens of
+banners, progress bars, `PASSED` lines and multi-page tracebacks. `ztest --llm`
+starts in ~1 ms, prints nothing for a passing test, and emits one JSON line per
+failure plus a final summary — measured 85.7 % fewer bytes than `pytest -v` on a
+42-test probe, and the gap widens as tracebacks deepen. A test that hangs inside
+a C extension holding the GIL cannot take the agent's session with it: the
+kernel kills the process group, not a Python-level timer. Numbers and method:
+[BENCHMARKS.md §1](BENCHMARKS.md).
+
+### 2. Containment and timeouts that hold (ADR-004)
+
+`pytest-timeout`'s signal method cannot interrupt a C extension that holds the
+GIL: the handler runs when the call returns, which is how a 1 s deadline became
+a 17.6 s wait, and how a call that never returns turns a one-minute CI step into
+a sixty-minute job. Its thread method uses `os._exit`, which leaves every child
+the test created alive and holding the job's pipes. ztest pins worker identity
+with `pidfd_open`, holds the zombie with `waitid(WNOWAIT)`, kills with
+`kill(-pgid, SIGKILL)`, sweeps `setsid` escapees under a child subreaper, and
+runs a native watchdog over a `MAP_SHARED` process-group registry — a hung
+worker dies on schedule and leaves zero processes behind (measured: 1.28 s,
+0 leaked processes). Rationale and accepted limits:
+[ADR-004](docs/adr/ADR-004-process-containment.md).
+
+### 3. A drop-in answer to `pytest-xdist`
+
+`pytest -n4` re-collects the suite in every worker over `execnet`, errors out
+whenever collection order differs between workers, and pays a full interpreter
+plus import graph per worker. In a nine-suite cross-check it failed on 3 of 9
+(33 %) and peaked at **1.70×–4.94× (median 2.60×) the memory of `ztest -j4`** —
+1.38 GiB against 462 MiB on dateparser. ztest forks workers from one pre-warmed
+zygote, schedules by file with LPT, recycles workers per file, and holds a flat
+memory ceiling on suites where a monolithic `pytest` is OOM-killed.
 
 ## What is ztest
 
@@ -51,11 +109,14 @@ and `_pytest` modules directly.
 
 - Linux (`x86_64` and `aarch64`). The supervisor relies on `pidfd_open(2)`, `statx(2)`,
   `prctl(PR_SET_PDEATHSIG)`, process groups and `/proc`.
-- Zig 0.17.0 to build.
 - Python 3.11 or newer at runtime, discoverable on `PATH` or passed with
   `--python=<path>`.
+- No build toolchain unless you build from source, which needs Zig 0.17.0.
 
-## Build and install
+## Build from source
+
+Prebuilt binaries and PyPI wheels are the normal path (see *Install in 1 second*).
+Contributors build from a checkout:
 
 ```sh
 git clone https://github.com/alexchen-sys/ztest
@@ -279,7 +340,17 @@ ZTEST_BIN=zig-out/bin/ztest python3 -m pytest tests/test_oss_regressions.py -q
 The binary under test is `$ZTEST_BIN` when set, else this repo's `zig-out`
 build, else the first `ztest` on `PATH`.
 
-`ztest --version` prints the version: `ztest 0.5.0 (Zig 0.17.0)`.
+`ztest --version` prints the version: `ztest 0.5.1 (Zig 0.17.0)`.
+
+## Benchmarks
+
+Full matrix, method, and the containment probes: [BENCHMARKS.md](BENCHMARKS.md).
+Over 100 real PyPI suites on 4 vCPU / 8 GiB: wall median **1.465×** faster than
+serial `pytest` across the 90 full-parity suites, **90/96 (93.8 %) FULL-PARITY**
+on the native engine and **94/96 (97.9 %)** with `--engine=pytest`; against
+`pytest -n4` (xdist), `ztest -j4` uses **1.70×–4.94× less peak memory (median
+2.60×)** and passes the 3 of 9 suites where xdist fails. Every number is
+reproducible from the manifest and the harness in `benchmarks/`.
 
 ## Limitations
 

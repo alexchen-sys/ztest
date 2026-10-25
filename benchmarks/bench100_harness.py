@@ -35,9 +35,19 @@ OUT = Path(os.environ.get("OUT_DIR", "/tmp/out"))
 REPO = Path("/tmp/repo")
 VENV = Path("/tmp/venv")
 ZTEST = os.environ.get("ZTEST_BIN", str(BENCH / "ztest" if (BENCH / "ztest").exists() else _HERE.parent / "zig-out/bin/ztest"))
-SAMPLE_INTERVAL = 0.45
+# PSS sampling cadence, documented as "sampled every 50 ms" in BENCHMARKS.md
+# (Method) and CHANGELOG.md. The sampler thread only exists when sample_mem is
+# true, so this constant is the only cadence: the old `0.05 if sample_mem else
+# SAMPLE_INTERVAL` expression always took the literal branch.
+SAMPLE_INTERVAL = 0.05
+# First tick, after the bash wrapper has exec'ed into the real runner.
+SAMPLE_INITIAL_DELAY = 0.03
 PYTEST_PIN = "pytest==9.0.3"
 PER_TEST_TIMEOUT = 300
+# Wall-clock resolution of a measured run. A blocking waitpid wakes the harness
+# in the same scheduling slice as child exit, so the number is real to ~1 ms;
+# keep four decimals so quantization cannot hide behind the rounding again.
+WALL_DECIMALS = 4
 
 
 def log(msg):
@@ -130,9 +140,19 @@ def tree_pss_kb(root_pid):
 
 def run_timed(tag, cmd, cwd, cap_s, out_path, env_extra=None, sample_mem=False):
     """One run: wall + exit code always. Memory only when sample_mem=True
-    (parity passes): pgid-scoped PSS sampler at 0.45 s plus cgroup
+    (parity passes): pgid-scoped PSS sampler at 50 ms plus cgroup
     memory.peak delta when writable. Measured passes run bare so the sampler
-    cannot asymmetrically tax the 4-worker arm."""
+    cannot asymmetrically tax the 4-worker arm.
+
+    Timing discipline: the child is reaped with a *blocking* waitpid in the
+    calling thread, and the deadline is enforced by a separate watchdog timer
+    that kills the process group at cap_s. `Popen.wait(timeout=...)` is not
+    used for measured runs: CPython implements it as an os.waitpid(WNOHANG)
+    poll loop with a backoff capped at 50 ms, so every run was rounded up to
+    the next 50 ms tick (0.164/0.214/0.264/0.314 s grid) and ztest looked
+    25–35 % slower than its own duration_ms. A blocking wait is woken by the
+    kernel the moment the child exits: overshoot is ~1 ms at 120 ms.
+    """
     env = dict(os.environ)
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     if env_extra:
@@ -145,41 +165,55 @@ def run_timed(tag, cmd, cwd, cap_s, out_path, env_extra=None, sample_mem=False):
         proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=outf,
                                 stderr=subprocess.STDOUT, start_new_session=True)
         stop = threading.Event()
+        done = threading.Event()
+        deadline_hit = threading.Event()
         samples = []
 
         def sampler():
             # Parity passes are unmeasured, so sampler cost is free: 50 ms
             # flat cadence, with the first tick after 30 ms so the bash
             # wrapper has exec'ed into the real runner before sampling.
-            stop.wait(0.03)
+            stop.wait(SAMPLE_INITIAL_DELAY)
             while not stop.is_set():
                 v = tree_pss_kb(proc.pid)
                 if v > 0:
                     samples.append(v)
-                stop.wait(0.05 if sample_mem else SAMPLE_INTERVAL)
+                stop.wait(SAMPLE_INTERVAL)
+
+        def watchdog():
+            # Cap enforcement without polling: sleep on an event the reaper
+            # sets, and only shoot the group if the deadline actually passes.
+            if done.wait(cap_s):
+                return
+            deadline_hit.set()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
         th = None
         if sample_mem:
             th = threading.Thread(target=sampler, daemon=True)
+        wd = threading.Thread(target=watchdog, daemon=True)
         t0 = time.monotonic()
         if th:
             th.start()
+        wd.start()
         try:
-            proc.wait(timeout=cap_s)
-            res["exit"] = proc.returncode
-        except subprocess.TimeoutExpired:
-            res["timeout"] = True
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
+            proc.wait()          # blocking waitpid(pid, 0) — no 50 ms quantum
+        finally:
+            t1 = time.monotonic()
+            done.set()
+            stop.set()
+        res["wall_s"] = round(t1 - t0, WALL_DECIMALS)
+        res["exit"] = proc.returncode
+        res["timeout"] = bool(deadline_hit.is_set()
+                              and proc.returncode == -signal.SIGKILL)
+        if res["timeout"]:
             res["exit"] = -9
-        res["wall_s"] = round(time.monotonic() - t0, 3)
-        stop.set()
         if th:
             th.join(timeout=2)
     res["samples"] = len(samples)
@@ -287,7 +321,18 @@ def sh(cmd, timeout, cwd=None):
     return r.returncode
 
 
+USAGE = __doc__ + """
+Environment:
+  BENCH_DIR   overrides the bench scratch dir holding manifest/plugin/ztest
+  OUT_DIR     where per-suite receipts land (default /tmp/out)
+  ZTEST_BIN   explicit ztest binary under test
+"""
+
+
 def main():
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:] or "--job" not in sys.argv:
+        print(USAGE.strip())
+        return 0 if ("-h" in sys.argv[1:] or "--help" in sys.argv[1:]) else 2
     job = json.loads(Path(sys.argv[sys.argv.index("--job") + 1]).read_text())
     name = job["project"]
     cap_s = int(job.get("run_cap_s", 900))
