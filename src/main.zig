@@ -1,8 +1,28 @@
 const std = @import("std");
-const linux = std.os.linux;
+const linux = @import("pal/mod.zig").posix;
 const spawn_arm = @import("spawn_arm.zig");
 const spawnArmed = spawn_arm.spawnArmed;
 const builtin = @import("builtin");
+
+const pal = @import("pal/mod.zig");
+
+// PAL aliases: every OS-specific primitive of the supervisor (ADR-004 containment,
+// output channels, /proc discovery) is consumed through src/pal. main.zig keeps no
+// raw syscall of its own; the Linux backend lives in pal/linux.zig, the Darwin
+// parity backend in pal/darwin.zig.
+const monotonicMs = pal.monotonicMs;
+const enableChildSubreaper = pal.enableChildSubreaper;
+const PgidCheck = pal.PgidCheck;
+const checkPeerPgid = pal.checkPeerPgid;
+const pidfdOpen = pal.pidfdOpen;
+const PgidRegistry = pal.PgidRegistry;
+const DirKey = pal.DirKey;
+const MSG_DONTWAIT: u32 = pal.MSG_DONTWAIT;
+const MSG_NBIO: u32 = pal.MSG_NBIO;
+const MSG_NOSIGNAL: u32 = pal.MSG_NOSIGNAL;
+const remainingMs = pal.remainingMs;
+const pidInList = pal.pidInList;
+const LinuxDirent64 = pal.LinuxDirent64;
 
 const pyfiles = @import("pyfiles.zig");
 const PyFileScan = pyfiles.PyFileScan;
@@ -31,22 +51,10 @@ const parseJobsCount = climod.parseJobsCount;
 const ParsedCli = climod.ParsedCli;
 const parseCliArgs = climod.parseCliArgs;
 
-// siginfo_t.si_pid sits at offset 16 on 64-bit Linux (x86_64 and aarch64:
-// si_signo i32 [0..4], si_errno i32 [4..8], si_code i32 [8..12], _pad0 i32 [12..16], si_pid i32 [16..20]).
-// On any other architecture compilation must fail rather than silently reading the wrong offset.
-comptime {
-    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .aarch64) {
-        @compileError("si_pid offset 16 verified for x86_64 and aarch64 Linux only");
-    }
-}
-
-fn siginfoPid(buf: *const [128]u8) i32 {
-    return std.mem.readInt(i32, buf[16..20], .little);
-}
-
 pub const ZTST_MAGIC: u32 = 0x5A545354; // "ZTST"
 pub const IPC_HEADER_SIZE: usize = 20;
 pub const EMBEDDED_SHIM: []const u8 = @embedFile("shim/ztest_shim.py");
+pub const EMBEDDED_PROJECT_DETECT: []const u8 = @embedFile("shim/modules/_project_detect.py");
 
 var g_interrupted: std.atomic.Value(u32) = .init(0);
 
@@ -75,131 +83,6 @@ pub fn installSignalHandlers() void {
     _ = linux.sigaction(linux.SIG.INT, &term_act, null);
     _ = linux.sigaction(linux.SIG.TERM, &term_act, null);
     _ = linux.sigaction(linux.SIG.HUP, &term_act, null);
-}
-
-pub fn monotonicMs() i64 {
-    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
-
-pub fn remainingMs(deadline_ms: i64) i32 {
-    const rem = deadline_ms - monotonicMs();
-    if (rem <= 0) return 0;
-    if (rem > std.math.maxInt(i32)) return std.math.maxInt(i32);
-    return @intCast(rem);
-}
-
-/// Enables PR_SET_CHILD_SUBREAPER (36) so orphaned Zygote workers and reparented grandchildren
-/// are adopted by this supervisor and can be reaped via waitPidWithDeadline.
-pub fn enableChildSubreaper() void {
-    _ = linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
-}
-
-/// Outcome of the process-group containment check for an authenticated peer.
-pub const PgidCheck = enum {
-    /// getpgid(pid) == pid verified right now (live group leader).
-    leader,
-    /// ESRCH: the peer already exited and was reaped. Sound to accept: in both shim worker paths the
-    /// worker calls setpgid(0,0) before _connect_ipc_fd199, so an authenticated connection from
-    /// worker_pid proves the invariant held at connect time. A dead peer needs
-    /// no containment; Phase 4 recovers its real status via REAP/waitPidWithDeadline.
-    dead_or_reaped,
-    /// Live peer in a foreign process group: containment invariant violated -> the peer is rejected.
-    violator,
-};
-
-/// Verifies the process-group invariant `getpgid(pid) == pid` via raw `linux.syscall1(.getpgid, ...)`.
-/// One best-effort `setpgid` retry is attempted (only legal pre-exec) before declaring a violator.
-/// A fully-reaped peer (ESRCH) is reported separately so the accept
-/// path does not false-crash fast workers that already exited (connection-after-setpgid ordering in
-/// the shim guarantees the invariant held at connect time).
-pub fn checkPeerPgid(pid: i32) PgidCheck {
-    if (pid <= 0) return .violator;
-    const upid: usize = @intCast(pid);
-    const rc = linux.syscall1(.getpgid, upid);
-    if (linux.errno(rc) == .SUCCESS and rc == upid) return .leader;
-    if (linux.errno(rc) == .SRCH) return .dead_or_reaped;
-    // Not a leader (or transient error): one best-effort pre-exec setpgid retry, then re-check.
-    _ = linux.setpgid(pid, pid);
-    const rc2 = linux.syscall1(.getpgid, upid);
-    if (linux.errno(rc2) == .SUCCESS and rc2 == upid) return .leader;
-    if (linux.errno(rc2) == .SRCH) return .dead_or_reaped;
-    return .violator;
-}
-
-fn pidInList(list: []const i32, pid: i32) bool {
-    for (list) |p| {
-        if (p == pid) return true;
-    }
-    return false;
-}
-
-/// pidfd_open(2) via raw syscall: a pidfd pins the worker's underlying `struct pid`
-/// (not the numeric pid — the number is released for reuse the moment the process is reaped) and
-/// becomes readable (POLLIN) the moment the process EXITS, zombie state included. Reuse-safety of
-/// our kill signals comes from the pinned zombie plus the kill(-pgid)-before-reap ordering, not
-/// from the pidfd. Returns -1 on any failure (caller degrades to the deadline-only behavior).
-pub fn pidfdOpen(pid: i32) linux.fd_t {
-    if (pid <= 0) return -1;
-    const rc = linux.syscall2(.pidfd_open, @as(usize, @intCast(pid)), 0);
-    if (linux.errno(rc) != .SUCCESS) return -1;
-    return @intCast(rc);
-}
-
-/// Selectively reaps zombie children adopted via PR_SET_CHILD_SUBREAPER, without recording
-/// statuses: the kernel recycles a pid the moment it is reaped, so a bare-pid status map could
-/// hand Phase 4 a stale entry for a colliding reused pid and fabricate a false CRASHED(9).
-/// Registered (protected) worker zombies are never reaped here — active slots still signal those
-/// pids (`kill(-pid)` group sweeps) until their Phase 4 transition, and reaping would release the
-/// pid for reuse. The sweep peeks with WNOWAIT and reaps only unregistered adoptees; a bounded
-/// seen-set breaks the peek cycle when only protected zombies remain.
-pub fn reapAdoptedChildren(protected: []const i32) void {
-    var seen_buf: [256]i32 = undefined;
-    var seen_n: usize = 0;
-    while (true) {
-        var siginfo_buf: [128]u8 align(8) = @splat(0);
-        const prc = linux.syscall5(
-            .waitid,
-            0, // P_ALL
-            0,
-            @intFromPtr(&siginfo_buf),
-            linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT,
-            0,
-        );
-        switch (linux.errno(prc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return, // ECHILD: no children at all
-        }
-        const pid = siginfoPid(&siginfo_buf);
-        if (pid <= 0) return; // no zombie available right now
-        // The run watchdog counts as protected: the sweep never reaps it (the runMain defer
-        // owns that); the seen-set breaks the cycle, else a WNOWAIT peek of a zombie watchdog would loop the sweep.
-        if (pid == g_wd_pid or pidInList(protected, pid)) {
-            if (pidInList(seen_buf[0..seen_n], pid)) return; // full cycle: only protected zombies left
-            if (seen_n >= seen_buf.len) return;
-            seen_buf[seen_n] = pid;
-            seen_n += 1;
-            continue;
-        }
-        // Unregistered adoptee: reap it for real (pid-specific, never a blind wait4(-1)). The
-        // raw status is deliberately not recorded anywhere: only
-        // unregistered pids are reaped here, so no Phase 4 lookup can ever depend on it.
-        var st: i32 = -1;
-        while (true) {
-            const wrc = linux.wait4(pid, &st, 0, null);
-            switch (linux.errno(wrc)) {
-                .SUCCESS => break,
-                .INTR => continue,
-                else => {
-                    st = -1; // ECHILD race: already reaped elsewhere
-                    break;
-                },
-            }
-        }
-        seen_n = 0; // progress made: reset cycle detection
-    }
 }
 
 pub const ExitCode = enum(u8) {
@@ -447,87 +330,6 @@ pub fn jsonGetU32(obj: std.json.ObjectMap, key: []const u8) IpcError!u32 {
     return 0;
 }
 
-const LinuxDirent64 = extern struct {
-    d_ino: u64,
-    d_off: i64,
-    d_reclen: u16,
-    d_type: u8,
-    d_name: [1]u8,
-};
-
-/// Audits `/proc/<pid>/task` via `linux.getdents64` (c_uint length in Zig 0.17.0).
-pub fn countProcTasks(pid: i32) !usize {
-    var path_buf: [64]u8 = @splat(0);
-    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/task", .{pid}, 0);
-
-    const open_rc = linux.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    switch (linux.errno(open_rc)) {
-        .SUCCESS => {},
-        else => return error.ProcTaskOpenFailed,
-    }
-    const dir_fd: linux.fd_t = @intCast(open_rc);
-    defer _ = linux.close(dir_fd);
-
-    var dirent_buf: [4096]u8 align(@alignOf(LinuxDirent64)) = @splat(0);
-    var task_count: usize = 0;
-
-    while (true) {
-        const nread_rc = linux.getdents64(dir_fd, &dirent_buf, @intCast(dirent_buf.len));
-        switch (linux.errno(nread_rc)) {
-            .SUCCESS => {},
-            else => return error.GetdentsFailed,
-        }
-        if (nread_rc == 0) break;
-
-        var bpos: usize = 0;
-        while (bpos < nread_rc) {
-            const d: *const LinuxDirent64 = @ptrCast(@alignCast(&dirent_buf[bpos]));
-            if (d.d_reclen == 0) break;
-            const name_ptr: [*:0]const u8 = @ptrCast(&d.d_name[0]);
-            const name = std.mem.span(name_ptr);
-            if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
-                task_count += 1;
-            }
-            bpos += d.d_reclen;
-        }
-    }
-    return task_count;
-}
-
-pub fn isTestFileName(name: []const u8) bool {
-    if (!std.mem.endsWith(u8, name, ".py")) return false;
-    if (std.mem.startsWith(u8, name, "test_")) return true;
-    if (std.mem.endsWith(u8, name, "_test.py")) return true;
-    return false;
-}
-
-fn isDirectoryProbe(path_slice: []const u8) bool {
-    var pbuf: [4096]u8 = @splat(0);
-    const pz = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path_slice}, 0) catch return false;
-    const rc = linux.open(pz.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) == .SUCCESS) {
-        _ = linux.close(@intCast(rc));
-        return true;
-    }
-    return false;
-}
-
-/// Directory identity for the discovery visited-set: the key is taken from
-/// fstat of the already-open directory fd, i.e. after the kernel resolved any symlink chain on
-/// the path. Two different symlink paths into the same directory collapse to one (st_dev, st_ino)
-/// key, so directory cycles (a→., b→.) are pruned on entry instead of recursing exponentially.
-const DirKey = struct { dev: u64, ino: u64 };
-
-/// statx(2) on an open fd; null on syscall failure, letting discovery degrade to
-/// untracked recursion (an outcome statx on an open directory fd practically never produces).
-fn dirKeyOfFd(fd: linux.fd_t) ?DirKey {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &stx);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    const dev: u64 = (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor);
-    return .{ .dev = dev, .ino = stx.ino };
-}
-
 /// Discovery diagnostics: a traversal error (getdents64 failure, path
 /// too long) is not silently treated as complete coverage. Design decision (documented): warn on
 /// stderr and keep going instead of failing the run — one hostile/broken subtree cannot abort a
@@ -564,7 +366,16 @@ pub fn discoverTestFiles(gpa: std.mem.Allocator, root_path: []const u8, out_file
     // norecursedirs from ini (replaces the built-in set)
     var nrp: PyFilePatterns = .{};
     const has_norecurse = loadNorecursedirs(root_path, &nrp);
-    if (pats.overflow or nrp.overflow) return error.TooManyPatterns;
+    pyfiles.validateConfigLimits(&pats, &nrp) catch |err| {
+        if (err == error.ConfigTooLarge) {
+            const bad = if (pats.config_too_large) &pats else &nrp;
+            var msg_buf: [4400]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "ztest: error: config file {s} exceeds 256 KiB read limit\n", .{bad.configPath()}) catch
+                "ztest: error: config file exceeds 256 KiB read limit\n";
+            writeStderr(msg);
+        }
+        return err;
+    };
     // Custom-collector scope (subdirectory target): the scope is
     // inherited top-down — with a target below a conftest.py declaring the hook
     // (ztest tests/examplefiles/abnf) the ancestor chain must be walked too,
@@ -692,17 +503,11 @@ pub fn dedupSortedFileList(gpa: std.mem.Allocator, files: *std.ArrayListUnmanage
     files.shrinkRetainingCapacity(w);
 }
 
-/// Canonicalize discovered file paths (kernel realpath, no libc: std's
-/// realpath was removed in Zig 0.17) so that string-different but same-file entries
-/// (`ztest ./tests tests` discovers `./tests/test_x.py` and `tests/test_x.py`) collapse in
-/// the sort+dedup pass that follows. O_PATH open + readlinkat(fd, "") (AT_EMPTY_PATH,
-/// Linux >= 2.6.39), falling back to /proc/self/fd/<n>. `file::nodeid` targets canonicalize
-/// the file prefix only; a path that fails to resolve stays as-is (its error is reported
-/// later by the worker/loader — canonicalization must never mask a bad target). Every
-/// canonicalized replacement frees the string it replaces: no leaks.
+/// Canonicalize the file part of each target through the PAL. Linux keeps its
+/// O_PATH/readlinkat path; Darwin uses realpath(3). A path that cannot resolve
+/// is retained so the normal missing-target diagnostic is not masked.
 pub fn canonicalizeFileList(gpa: std.mem.Allocator, files: *std.ArrayListUnmanaged([]u8)) !void {
     var link_buf: [4096]u8 = @splat(0);
-    var path_buf: [64]u8 = @splat(0);
     for (files.items, 0..) |f, i| {
         var file_part: []const u8 = f;
         var selector: []const u8 = "";
@@ -712,21 +517,7 @@ pub fn canonicalizeFileList(gpa: std.mem.Allocator, files: *std.ArrayListUnmanag
         }
         var target_buf: [4096]u8 = @splat(0);
         const target_z = std.fmt.bufPrintSentinel(&target_buf, "{s}", .{file_part}, 0) catch continue;
-        const open_rc = linux.openat(linux.AT.FDCWD, target_z.ptr, .{ .PATH = true, .CLOEXEC = true }, 0);
-        if (linux.errno(open_rc) != .SUCCESS) continue;
-        const fd: linux.fd_t = @intCast(open_rc);
-        defer _ = linux.close(fd);
-
-        var n: usize = 0;
-        const rl_rc = linux.readlinkat(fd, "", &link_buf, link_buf.len);
-        if (linux.errno(rl_rc) == .SUCCESS and rl_rc > 0) {
-            n = @intCast(rl_rc);
-        } else {
-            const proc_z = std.fmt.bufPrintSentinel(&path_buf, "/proc/self/fd/{d}", .{fd}, 0) catch continue;
-            const rl2_rc = linux.readlinkat(linux.AT.FDCWD, proc_z.ptr, &link_buf, link_buf.len);
-            if (linux.errno(rl2_rc) != .SUCCESS or rl2_rc == 0) continue;
-            n = @intCast(rl2_rc);
-        }
+        const n = pal.canonicalizePath(target_z.ptr, &link_buf) orelse continue;
         if (selector.len == 0) {
             const real = try gpa.dupe(u8, link_buf[0..n]);
             gpa.free(f);
@@ -768,7 +559,7 @@ fn discoverTestFilesInner(gpa: std.mem.Allocator, root_path: []const u8, out_fil
 
     // Cycle prune: the key comes from the open fd, so the kernel has already resolved
     // any symlink chain; a directory we have visited under any path is skipped entirely.
-    if (dirKeyOfFd(dir_fd)) |key| {
+    if (pal.dirKeyOfFd(dir_fd)) |key| {
         if (visited.contains(key)) return;
         try visited.put(gpa, key, {});
     }
@@ -814,7 +605,7 @@ fn discoverTestFilesInner(gpa: std.mem.Allocator, root_path: []const u8, out_fil
             var is_dir = (d.d_type == 4);
             var is_reg = (d.d_type == 8);
             if (d.d_type == 0 or d.d_type == 10) {
-                if (isDirectoryProbe(joined)) {
+                if (pal.isDirectoryProbe(joined)) {
                     is_dir = true;
                 } else {
                     is_reg = true;
@@ -874,16 +665,13 @@ fn lessThanStr(_: void, a: []u8, b: []u8) bool {
 ///            workers, which inherit fd 1/2) concatenate instead of clobbering each other.
 ///   .ofd   — FIFO / character device (terminal, /dev/null): a private open file description via
 /// /proc/self/fd, O_NONBLOCK|O_CLOEXEC + carried O_APPEND/DSYNC/SYNC.
-///   .sock  — socket sink: /proc/self/fd does not reopen sockets (ENXIO), so we write on the
-///            original fd with send(MSG_DONTWAIT|MSG_NOSIGNAL): non-blocking per call without
-///            touching the socket's flags.
+///   .sock  — socket sink: reopening a socket cannot create an independent endpoint, so we write
+///            on the original fd with MSG_DONTWAIT plus the Darwin MSG_NBIO backpressure flag.
+///            Each call is nonblocking without changing the shared socket's O_NONBLOCK state.
 ///   .drop  — FIFO/tty sink whose private OFD could not be reopened (e.g. read-only permissions):
 ///            writes are discarded and counted in dropped_bytes; a fifo/tty never degrades to a
 ///            blocking .plain write (supervision must not hang on an unwritable sink).
 const MAX_OUT_BACKLOG: usize = 1 << 20;
-
-const MSG_DONTWAIT: u32 = 0x40; // Linux x86-64: per-call non-blocking send
-const MSG_NOSIGNAL: u32 = 0x4000; // Linux x86-64: no SIGPIPE on dead peer
 
 const OutSinkMode = enum { plain, ofd, sock, drop };
 
@@ -932,12 +720,12 @@ fn outBufferTail(ch: *OutChan, tail: []const u8) void {
     };
 }
 
-/// One write attempt on the channel's sink: write() for plain/ofd, send(MSG_DONTWAIT|MSG_NOSIGNAL)
+/// One write attempt on the channel's sink: write() for plain/ofd, send(MSG_DONTWAIT|MSG_NBIO|MSG_NOSIGNAL)
 /// for socket sinks (per-call non-blocking, socket flags untouched).
 fn outWriteOnce(ch: *const OutChan, buf: []const u8) usize {
     return switch (ch.mode) {
         .plain, .ofd => linux.write(ch.fd, buf.ptr, buf.len),
-        .sock => linux.sendto(ch.fd, buf.ptr, buf.len, MSG_DONTWAIT | MSG_NOSIGNAL, null, 0),
+        .sock => linux.sendto(ch.fd, buf.ptr, buf.len, MSG_DONTWAIT | MSG_NBIO | MSG_NOSIGNAL, null, 0),
         .drop => 0,
     };
 }
@@ -955,7 +743,10 @@ fn outFlush(ch: *OutChan) void {
     while (off < items.len) {
         const rc = outWriteOnce(ch, items[off..]);
         switch (linux.errno(rc)) {
-            .SUCCESS => off += rc,
+            .SUCCESS => {
+                if (rc == 0) break; // no progress: retry later, never spin in the flusher
+                off += rc;
+            },
             .INTR => {
                 intr_spins += 1;
                 if (intr_spins > 64) break;
@@ -999,7 +790,13 @@ fn outWrite(ch: *OutChan, msg: []const u8) void {
     while (off < msg.len) {
         const rc = outWriteOnce(ch, msg[off..]);
         switch (linux.errno(rc)) {
-            .SUCCESS => off += rc,
+            .SUCCESS => {
+                if (rc == 0) {
+                    if (off == 0) outBufferWhole(ch, msg) else outBufferTail(ch, msg[off..]);
+                    return;
+                }
+                off += rc;
+            },
             .INTR => {
                 intr_spins += 1;
                 if (intr_spins > 64) {
@@ -1039,7 +836,10 @@ fn outFlushBounded(ch: *OutChan, deadline_ms: i64) void {
         if (isInterrupted()) break;
         const rc = outWriteOnce(ch, items[off..]);
         switch (linux.errno(rc)) {
-            .SUCCESS => off += rc,
+            .SUCCESS => {
+                if (rc == 0) break; // no progress: the bounded caller may poll or drop later
+                off += rc;
+            },
             .INTR => {
                 intr_spins += 1;
                 if (intr_spins > 64) break;
@@ -1157,32 +957,19 @@ pub fn pollFdUntilDeadline(fd: linux.fd_t, deadline_ms: i64) IpcError!bool {
     }
 }
 
-pub const Ucred = extern struct {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-};
+pub const Ucred = pal.Ucred;
 
-/// Verifies peer credentials (`SO_PEERCRED`) of an accepted Unix domain socket connection.
+/// Verifies peer credentials of an accepted Unix domain socket connection
+/// (SO_PEERCRED on Linux, LOCAL_PEERCRED on Darwin — one contract behind the PAL).
 pub fn verifySocketPeerCred(conn_fd: linux.fd_t, expected_uid: u32, expected_pid: ?i32) IpcError!Ucred {
-    var cred: Ucred = .{ .pid = -1, .uid = 0xFFFFFFFF, .gid = 0xFFFFFFFF };
-    var opt_len: u32 = @sizeOf(Ucred);
-    const rc = linux.getsockopt(conn_fd, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &opt_len);
-    if (linux.errno(rc) != .SUCCESS or opt_len != @sizeOf(Ucred)) {
-        return error.PeerCredFailed;
-    }
-    if (cred.uid != expected_uid) {
-        return error.UnauthorizedPeer;
-    }
-    if (expected_pid) |epid| {
-        if (cred.pid != epid) {
-            return error.WorkerPidMismatch;
-        }
-    }
-    return cred;
+    return pal.verifySocketPeerCred(conn_fd, expected_uid, expected_pid) catch |err| switch (err) {
+        error.PeerCredFailed => error.PeerCredFailed,
+        error.UnauthorizedPeer => error.UnauthorizedPeer,
+        error.WorkerPidMismatch => error.WorkerPidMismatch,
+    };
 }
 
-/// Accepts a connection before `deadline_ms` and authenticates the peer via `SO_PEERCRED`.
+/// Accepts a connection before `deadline_ms` and authenticates the peer via the PAL.
 /// Stale or mismatched connections in the backlog are closed and skipped until the expected peer connects.
 /// Accepted sockets are `SOCK.NONBLOCK | SOCK.CLOEXEC` (head-of-line blocking).
 /// When `require_pgid_leader` is set, the peer must satisfy `getpgid(pid) == pid` (one best-effort
@@ -1520,7 +1307,7 @@ fn fitWithEllipsis(text: []const u8, buf: []u8) []const u8 {
     buf[n] = 0xE2; // U+2026 HORIZONTAL ELLIPSIS, written byte-wise so the buffer
     buf[n + 1] = 0x80; // arithmetic stays explicit (no UTF-8 slicing tricks)
     buf[n + 2] = 0xA6;
-    return buf[0..n + 3];
+    return buf[0 .. n + 3];
 }
 
 var g_failed_notes: [MAX_SUMMARY_FAILS]FailedTestNote = undefined;
@@ -1872,7 +1659,7 @@ fn finalizeSlotEof(gpa: std.mem.Allocator, aw: *ActiveWorker) void {
         aw.payload_buf = &.{};
     }
     if (!aw.summary.got_file_done and aw.worker_pid > 0) {
-        killGroup(aw.worker_pid);
+        pal.killGroup(aw.worker_pid);
         _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
         aw.exit_deadline_ms = 0;
     } else if (aw.summary.got_file_done and aw.worker_pid > 0) {
@@ -1973,56 +1760,38 @@ fn drainWorkerFrames(
 /// Bounded WNOHANG reap loop: never blocks forever on a D-state worker.
 /// Returns the raw wait status, or -1 if the child could not be reaped within `deadline_ms`.
 fn reapChildBounded(pid: i32, deadline_ms: i64) i32 {
-    var status: i32 = -1;
-    while (true) {
-        const wrc = linux.wait4(pid, &status, linux.W.NOHANG, null);
-        switch (linux.errno(wrc)) {
-            .SUCCESS => {
-                if (wrc != 0) return status; // reaped
-            },
-            .INTR => continue,
-            else => return -1, // ECHILD: not our child (already reaped elsewhere)
-        }
-        if (remainingMs(deadline_ms) <= 0) return -1;
-        var req_ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
-        _ = linux.nanosleep(&req_ts, null);
-    }
+    return pal.reapChildBounded(pid, deadline_ms);
 }
 
 /// Non-blocking wait4 loop with deadline + WNOWAIT group sweep.
 /// Interrupt-aware: on SIGINT/SIGTERM it SIGKILLs the worker group and reaps with a bound instead of
 /// waiting out the full deadline.
 fn waitPidWithDeadline(pid: i32, deadline_ms: i64) i32 {
-    var siginfo_buf: [128]u8 align(8) = @splat(0);
-    while (remainingMs(deadline_ms) > 0) {
-        if (isInterrupted()) {
-            killGroup(pid);
-            _ = linux.kill(pid, linux.SIG.KILL);
-            return reapChildBounded(pid, monotonicMs() + 2_000);
-        }
-        // Peek with WEXITED | WNOHANG | WNOWAIT so pid stays pinned as zombie while we sweep -pid.
-        const wrc = linux.syscall5(
-            .waitid,
-            1, // P_PID
-            @as(usize, @intCast(pid)),
-            @intFromPtr(&siginfo_buf),
-            linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT,
-            0,
-        );
-        if (linux.errno(wrc) == .INTR) continue;
-        if (linux.errno(wrc) != .SUCCESS) return -1; // ECHILD: not our child — never kill a pid we do not own
-        const si_pid = siginfoPid(&siginfo_buf);
-        if (si_pid == pid) {
-            // Leader is now a zombie holding PGID `pid`: safe to SIGKILL any remaining grandchildren in `-pid`.
-            killGroup(pid);
-            return reapChildBounded(pid, monotonicMs() + 2_000);
-        }
-        var req_ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
-        _ = linux.nanosleep(&req_ts, null);
+    return pal.impl.waitPidWithDeadline(pid, deadline_ms, isInterrupted);
+}
+
+/// The orphan-sweep ownership threshold — `min` starttime over every live worker of the
+/// rolling dispatcher (`state == .active` and a committed pid). A candidate strictly older than
+/// this value cannot be a descendant of any live worker.
+///
+/// * `null` — no live worker at all: no live sibling's domain to protect, kill everything unprotected.
+/// * `0`    — some live worker's starttime could not be read. Zero is never greater than any real
+///            starttime, so every candidate hits the `>= threshold` guard and is spared: the
+///            sweep degrades to "kill nothing", which is the safe answer (a too-large
+///            threshold would kill a live sibling's descendant).
+fn minActiveWorkerStartTicks(slots: []const RunSlot) ?u64 {
+    var min_ticks: ?u64 = null;
+    var unknown = false;
+    for (slots) |*s| {
+        if (s.state != .active or s.aw.worker_pid <= 0) continue;
+        const ticks = pal.procStartTimeTicks(s.aw.worker_pid) orelse {
+            unknown = true;
+            continue;
+        };
+        if (min_ticks == null or ticks < min_ticks.?) min_ticks = ticks;
     }
-    killGroup(pid);
-    _ = linux.kill(pid, linux.SIG.KILL);
-    return reapChildBounded(pid, monotonicMs() + 2_000);
+    if (unknown) return 0;
+    return min_ticks;
 }
 
 /// REAP ownership: the slot has sent `REAP` and will never
@@ -2077,7 +1846,7 @@ fn abortSlotCleanup(
     }
     if (aw.worker_pid > 0) {
         if (!aw.reap_unconfirmed) {
-            killGroup(aw.worker_pid);
+            pal.killGroup(aw.worker_pid);
             _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
             // ADR-004 layer 3: unregister before reap — the same ordering as the
             // regular Phase 4: the watchdog-registry slot is released before
@@ -2112,8 +1881,12 @@ pub fn main(init: std.process.Init) u8 {
             outFlushAll();
             return ExitCode.usage_error.toU8();
         }
-        const msg = std.fmt.allocPrint(init.gpa, "ztest internal error: {s}\n", .{@errorName(err)}) catch "ztest internal error\n";
-        writeStderr(msg);
+        if (std.fmt.allocPrint(init.gpa, "ztest internal error: {s}\n", .{@errorName(err)})) |msg| {
+            defer init.gpa.free(msg);
+            writeStderr(msg);
+        } else |_| {
+            writeStderr("ztest internal error\n");
+        }
         outFlushAll();
         return ExitCode.internal_error.toU8();
     };
@@ -2133,365 +1906,6 @@ fn removePidFromList(list: *std.ArrayListUnmanaged(i32), pid: i32) void {
     }
 }
 
-/// Scans /proc for processes whose PPID == `self_pid` (children adopted via PR_SET_CHILD_SUBREAPER after a
-/// Zygote death, including never-registered fork-race workers) and SIGKILLs + reaps every one not in
-/// `exclude`. A process whose PGRP belongs to a protected worker is spared: that group is the
-/// worker's own domain and is swept by the worker's own teardown. `exclude` guards by bare PID,
-/// `protected_groups` by PGRP. The call is bounded by a 10 s budget: past it, remaining adoptees
-/// are still SIGKILLed but not reaped.
-///
-/// Candidate enumeration is `/proc/self/task/<pid>/children` (CONFIG_PROC_CHILDREN): under
-/// PR_SET_CHILD_SUBREAPER every adopted orphan is a direct child of the supervisor, so the kernel
-/// reports exactly the candidate set — O(children) instead of O(processes). A read failure falls
-/// back to a full /proc scan.
-///
-/// Ownership discriminator is the kernel start time (field 22 of /proc/<pid>/stat, jiffies):
-/// a candidate strictly older than the oldest live worker predates every live worker and is a
-/// leftover of a finished one; anything younger may be a live sibling's helper and is spared.
-/// `older_than_ticks` is that threshold; `null` selects kill-everything-not-protected for the
-/// quiescent/final sweeps and the Zygote teardown.
-fn killAdoptedOrphans(
-    self_pid: i32,
-    exclude: []const i32,
-    protected_groups: []const i32,
-    older_than_ticks: ?u64,
-) void {
-    const budget_deadline: i64 = monotonicMs() + 10_000;
-    // direct-children primary path: O(children) through /proc/self/task/<pid>/children.
-    var children_buf: [8192]u8 = undefined;
-    if (sweepAdoptedViaProcChildren(self_pid, exclude, protected_groups, budget_deadline, older_than_ticks, &children_buf)) return;
-
-    // Fallback (direct-children): full /proc scan.
-    const open_rc = linux.open("/proc", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(open_rc) != .SUCCESS) return;
-    const dir_fd: linux.fd_t = @intCast(open_rc);
-    defer _ = linux.close(dir_fd);
-
-    var dirent_buf: [8192]u8 align(@alignOf(LinuxDirent64)) = @splat(0);
-    while (true) {
-        const nread_rc = linux.getdents64(dir_fd, &dirent_buf, @intCast(dirent_buf.len));
-        if (linux.errno(nread_rc) != .SUCCESS or nread_rc == 0) break;
-
-        var bpos: usize = 0;
-        while (bpos < nread_rc) {
-            const d: *const LinuxDirent64 = @ptrCast(@alignCast(&dirent_buf[bpos]));
-            if (d.d_reclen == 0) break;
-            const name_ptr: [*:0]const u8 = @ptrCast(&d.d_name[0]);
-            const name = std.mem.span(name_ptr);
-            bpos += d.d_reclen;
-
-            const pid = std.fmt.parseInt(i32, name, 10) catch continue;
-            sweepOneAdoptee(pid, self_pid, exclude, protected_groups, budget_deadline, older_than_ticks);
-        }
-    }
-}
-
-/// direct-children: enumerate the supervisor's direct children through the CONFIG_PROC_CHILDREN
-/// file and run the standard sweep on each. Returns true when the enumeration succeeded (an EMPTY
-/// file is a success: "no children" is a valid answer, not an error), false when the caller must
-/// fall back to the full /proc scan.
-///
-/// Why this is sound: PR_SET_CHILD_SUBREAPER makes the supervisor the reaper of every orphaned
-/// descendant, so a reparented grandchild / FORK-race worker appears in this list by definition.
-/// The file is per-thread, but adoption attaches to the thread-group leader (find_new_reaper ->
-/// find_alive_thread) and the supervisor forks from that same main thread, so the single
-/// `<self_pid>` task dir covers everything; were the process ever multi-threaded, we fall back to
-/// the full scan instead of silently enumerating a subset.
-fn sweepAdoptedViaProcChildren(
-    self_pid: i32,
-    exclude: []const i32,
-    protected_groups: []const i32,
-    budget_deadline: i64,
-    older_than_ticks: ?u64,
-    buf: []u8,
-) bool {
-    const thread_count = countProcTasks(self_pid) catch return false;
-    if (thread_count != 1) return false;
-
-    var path_buf: [64]u8 = @splat(0);
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/self/task/{d}/children", .{self_pid}, 0) catch return false;
-    const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return false;
-    const fd: linux.fd_t = @intCast(fd_rc);
-    defer _ = linux.close(fd);
-
-    var total: usize = 0;
-    var saw_eof = false;
-    while (total < buf.len) {
-        const rd_rc = linux.read(fd, buf[total..].ptr, buf.len - total);
-        switch (linux.errno(rd_rc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return false, // read error: fall back to the full scan
-        }
-        if (rd_rc == 0) {
-            saw_eof = true;
-            break;
-        }
-        total += @intCast(rd_rc);
-    }
-    // Buffer full without EOF: the last pid may be truncated mid-digits, and a truncated pid is a
-    // different pid — never guess, fall back to the full scan (a supervisor with >1000 direct
-    // children is already far outside any supported topology).
-    if (!saw_eof) return false;
-
-    var it = std.mem.tokenizeAny(u8, buf[0..total], " \n\t");
-    while (it.next()) |tok| {
-        const pid = std.fmt.parseInt(i32, tok, 10) catch continue;
-        sweepOneAdoptee(pid, self_pid, exclude, protected_groups, budget_deadline, older_than_ticks);
-    }
-    return true;
-}
-
-/// One candidate of the orphan sweep. Shared by the direct-children path and
-/// the full-/proc fallback, so the two enumerations can never drift apart in
-/// filtering.
-fn sweepOneAdoptee(
-    pid: i32,
-    self_pid: i32,
-    exclude: []const i32,
-    protected_groups: []const i32,
-    budget_deadline: i64,
-    older_than_ticks: ?u64,
-) void {
-    if (pid <= 0 or pid == self_pid) return;
-    if (pid == g_wd_pid) return; // the run watchdog is untouchable here (spared by every sweep)
-    if (pidInList(exclude, pid)) return;
-
-    // Parse /proc/<pid>/stat: fields after the last ')' are: state(1) ppid(2) pgrp(3)...
-    var stat_path_buf: [64]u8 = @splat(0);
-    const stat_path = std.fmt.bufPrintSentinel(&stat_path_buf, "/proc/{d}/stat", .{pid}, 0) catch return;
-    const sfd_rc = linux.open(stat_path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    // Race: a pid listed in `children` may already be gone by the time we stat it (reaped
-    // elsewhere) -> ENOENT -> skip, exactly the degradation the full scan always had.
-    if (linux.errno(sfd_rc) != .SUCCESS) return;
-    const sfd: linux.fd_t = @intCast(sfd_rc);
-    var stat_buf: [512]u8 = @splat(0);
-    const rd_rc = linux.read(sfd, &stat_buf, stat_buf.len);
-    _ = linux.close(sfd);
-    if (linux.errno(rd_rc) != .SUCCESS or rd_rc <= 0) return;
-    const stat_slice = stat_buf[0..@intCast(rd_rc)];
-    const close_paren = std.mem.lastIndexOfScalar(u8, stat_slice, ')') orelse return;
-    if (close_paren + 2 > stat_slice.len) return;
-    var fields = std.mem.tokenizeScalar(u8, stat_slice[close_paren + 1 ..], ' ');
-    _ = fields.next() orelse return; // state
-    const ppid_s = fields.next() orelse return; // ppid
-    const ppid = std.fmt.parseInt(i32, ppid_s, 10) catch return;
-    if (ppid != self_pid) return;
-    // Pgrp is the next field (after ppid). A process living in a
-    // protected worker's process group is that worker's domain — spared here (the
-    // worker's Phase 4 group sweep owns it). Only this read-order survives `comm`
-    // values containing spaces: everything after the last ')' is positional.
-    const pgrp_s = fields.next() orelse return; // pgrp
-    const pgrp = std.fmt.parseInt(i32, pgrp_s, 10) catch return;
-    if (pidInList(protected_groups, pgrp)) return;
-
-    // Per-file ownership, starttime guard: a descendant starts strictly
-    // after its ancestor, so a candidate whose starttime is >= the oldest live worker's starttime
-    // can still be a descendant of a live sibling file — spared. Only candidates strictly older
-    // than every live worker are provably leftovers of terminated workers (or of the Zygote /
-    // FORK-race), and only those are killed. Everything unparsable is skipped, never killed
-    // (skipped, never killed). `older_than_ticks == null` (quiescent sweep, final
-    // containment) selects kill-everything-not-protected: no live worker exists to protect.
-    if (older_than_ticks) |threshold| {
-        const starttime = parseStartTimeTicks(stat_slice) orelse return; // unparsable -> spare
-        if (starttime >= threshold) return; // younger-or-equal -> may belong to a live sibling
-    }
-
-    // Adopted orphan (FORK-race worker or reparented grandchild): kill its group only
-    // when it verified as a group leader, then reap.
-    // Status not recorded (stale-pid collisions).
-    // getpgid(pid)==pid is mandatory before killGroup — the pgid namespace
-    // outlives the group leader's death; on pid reuse kill(-pid) would hit a foreign group.
-    const adoptee_pgrp_rc = linux.syscall1(.getpgid, @as(usize, @intCast(pid)));
-    if (linux.errno(adoptee_pgrp_rc) == .SUCCESS and adoptee_pgrp_rc == @as(usize, @intCast(pid))) {
-        killGroup(pid);
-    }
-    _ = linux.kill(pid, linux.SIG.KILL);
-    // Bounded sweep — after the 10 s budget is spent the kill still
-    // fires (containment first) but the reap is skipped so the supervisor cannot stall
-    // behind N unkillable D-state adoptees.
-    const now_ms = monotonicMs();
-    if (now_ms < budget_deadline) {
-        const wait_deadline: i64 = @min(budget_deadline, now_ms + 2_000);
-        _ = waitPidWithDeadline(pid, wait_deadline);
-    }
-}
-
-/// `starttime` of a process from an already READ /proc/<pid>/stat buffer.
-///
-/// Field layout (man 5 proc), 1-based: 1 pid, 2 comm, 3 state, 4 ppid, 5 pgrp, 6 session,
-/// 7 tty_nr, 8 tpgid, 9 flags, 10 minflt, 11 cminflt, 12 majflt, 13 cmajflt, 14 utime,
-/// 15 stime, 16 cutime, 17 cstime, 18 priority, 19 nice, 20 num_threads, 21 itrealvalue,
-/// 22 starttime. Fields 3.. are positional only after the last ')' (comm may contain spaces and
-/// ')'), so the first token after the last ')' is field 3 (state) and starttime — field 22 —
-/// is token index 22 - 3 = 19. Nineteen tokens are therefore skipped before the read.
-fn parseStartTimeTicks(stat_slice: []const u8) ?u64 {
-    // Truncation guard: /proc/<pid>/stat lines always end with '\n'. A buffer that does not is
-    // cut short (the caller reads into a fixed 512-byte buffer), and a truncated number parses
-    // into a smaller value — i.e. a candidate would look older than it is and could be killed.
-    // "Cannot tell" must spare, never kill.
-    if (stat_slice.len == 0 or stat_slice[stat_slice.len - 1] != '\n') return null;
-    const close_paren = std.mem.lastIndexOfScalar(u8, stat_slice, ')') orelse return null;
-    if (close_paren + 2 > stat_slice.len) return null;
-    var fields = std.mem.tokenizeScalar(u8, stat_slice[close_paren + 1 ..], ' ');
-    var skipped: usize = 0;
-    while (skipped < 19) : (skipped += 1) _ = fields.next() orelse return null;
-    const starttime_s = fields.next() orelse return null;
-    return std.fmt.parseInt(u64, starttime_s, 10) catch null;
-}
-
-/// Starttime (field 22, see `parseStartTimeTicks`) of `pid`, read from /proc. `null` when
-/// the process is gone (ENOENT), unreadable or the line is malformed — callers must treat null as
-/// "unknown" and fail closed (never kill on unknown ownership).
-fn procStartTimeTicks(pid: i32) ?u64 {
-    if (pid <= 0) return null;
-    var path_buf: [64]u8 = @splat(0);
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
-    const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(fd_rc);
-    var stat_buf: [512]u8 = @splat(0);
-    const rd_rc = linux.read(fd, &stat_buf, stat_buf.len);
-    _ = linux.close(fd);
-    if (linux.errno(rd_rc) != .SUCCESS or rd_rc <= 0) return null;
-    return parseStartTimeTicks(stat_buf[0..@intCast(rd_rc)]);
-}
-
-/// The orphan-sweep ownership threshold — `min` starttime over every live worker of the
-/// rolling dispatcher (`state == .active` and a committed pid). A candidate strictly older than
-/// this value cannot be a descendant of any live worker.
-///
-/// * `null` — no live worker at all: no live sibling's domain to protect, kill everything unprotected.
-/// * `0`    — some live worker's starttime could not be read. Zero is never greater than any real
-///            starttime, so every candidate hits the `>= threshold` guard and is spared: the
-///            sweep degrades to "kill nothing", which is the safe answer (a too-large
-///            threshold would kill a live sibling's descendant).
-fn minActiveWorkerStartTicks(slots: []const RunSlot) ?u64 {
-    var min_ticks: ?u64 = null;
-    var unknown = false;
-    for (slots) |*s| {
-        if (s.state != .active or s.aw.worker_pid <= 0) continue;
-        const ticks = procStartTimeTicks(s.aw.worker_pid) orelse {
-            unknown = true;
-            continue;
-        };
-        if (min_ticks == null or ticks < min_ticks.?) min_ticks = ticks;
-    }
-    if (unknown) return 0;
-    return min_ticks;
-}
-
-/// FAIL-CLOSED group kill: kill(-pgid) with pgid == 1 is kill(-1) — a broadcast
-/// SIGKILL to the whole uid; pgid == 0 is kill(0) — our own group. Neither form
-/// is ever a legal containment target of ztest (a worker group is always
-/// pgid == pid > 1). The refusal is silent and cheap: an ESRCH equivalent.
-fn killGroup(pgid: i32) void {
-    if (pgid <= 1) return;
-    _ = linux.kill(-pgid, linux.SIG.KILL);
-}
-
-/// Watchdog registry (ADR-004 layer 3): capacity — 2× MAX_SLOTS (16 worker slots => 32 registry
-/// slots, ≥ 2× the maximum parallelism required by ADR-004; headroom for all simultaneous registrations).
-pub const PgidRegistry = struct {
-    pub const CAPACITY: usize = 32;
-    pub const MAP_LEN: usize = CAPACITY * 8; // 256 bytes: one page-aligned map
-
-    pub const View = struct {
-        slots: []align(8) volatile u64,
-
-        /// Atomic (aligned u64 store on x86_64) registration of a live worker's pgid.
-        /// pgid > 1 is valid (pgid = pid > 1 after setpgid(0,0) => pgid == the worker's pid),
-        /// 0 — "slot free". pgid <= 1 is rejected: pgid == 1 under kill(-pgid) is
-        /// kill(-1) — a broadcast SIGKILL to the whole uid; pgid == 0 is kill(0) — our
-        /// own group. Neither form is a legal target.
-        pub fn register(self: View, pgid: i32) bool {
-            if (pgid <= 1) return false;
-            const v: u64 = @intCast(pgid);
-            // Idempotency: registration may happen before accept
-            // (FORKED-parse / post-setpgid) and at accept — re-registering the same pgid must not
-            // take a second slot (else killAll would fire twice and unregister
-            // would free only the first duplicate).
-            for (self.slots) |*s| {
-                if (@atomicLoad(u64, s, .monotonic) == v) return true;
-            }
-            for (self.slots) |*s| {
-                if (@atomicLoad(u64, s, .monotonic) == 0) {
-                    @atomicStore(u64, s, v, .release);
-                    return true;
-                }
-            }
-            return false; // registry overflow — registry fail-open (see the comment below)
-        }
-
-        /// Frees the slot on the worker's REAP (slot reuse).
-        pub fn unregister(self: View, pgid: i32) void {
-            if (pgid <= 1) return;
-            const v: u64 = @intCast(pgid);
-            for (self.slots) |*s| {
-                if (@atomicLoad(u64, s, .monotonic) == v) {
-                    @atomicStore(u64, s, 0, .release);
-                    return;
-                }
-            }
-        }
-
-        /// Watchdog: walks the registry after the writer's death, killpg on every nonzero entry.
-        pub fn killAll(self: View) void {
-            for (self.slots) |*s| {
-                const v = @atomicLoad(u64, s, .acquire);
-                if (v == 0) continue;
-                const pgid: i32 = @intCast(v);
-                killGroup(pgid);
-            }
-        }
-    };
-
-    /// Allocates the registry's anonymous shared mapping (MAP_SHARED|MAP_ANONYMOUS), zeroed.
-    pub fn create() !View {
-        const rc = linux.mmap(
-            null,
-            MAP_LEN,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED, .ANONYMOUS = true },
-            -1,
-            0,
-        );
-        if (linux.errno(rc) != .SUCCESS) return error.WatchdogMmapFailed;
-        const addr: [*]align(8) u8 = @ptrFromInt(rc);
-        return .{ .slots = @as([*]volatile u64, @ptrCast(addr))[0..CAPACITY] };
-    }
-
-    pub fn destroy(view: View) void {
-        _ = linux.munmap(@ptrCast(@volatileCast(view.slots.ptr)), MAP_LEN);
-    }
-};
-
-/// Run watchdog (ADR-004 layer 3): One fork for the whole run, one process.
-/// The watchdog is a direct child of the supervisor placed in its own group:
-///  - setpgid(0,0) right after fork — a killpg from a test at a worker group never touches it,
-///    and it is not a member of the supervisor's group;
-///  - close_range(3..∞) — only 0/1/2 and the supervisor's pidfd remain;
-///  - poll(pidfd) blocks until the supervisor dies (a pidfd stays valid in the zombie state);
-///  - on the writer's death: killAll(g_wd_reg) — killpg(-pgid, SIGKILL) per entry — _exit(0).
-/// Test code cannot reach it: it is not a child of a worker (os.wait(-1) in tests never lands
-/// on it), it is not python (survives `pkill python`), and it is in no worker group.
-/// The supervisor reaps it by pid on a normal run end (the defer in runMain: kill+reap).
-pub fn armPdeathsigOn(parent_pid: i32) void {
-    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
-    if (@as(i32, @intCast(linux.getppid())) != parent_pid) {
-        linux.exit_group(125);
-    }
-}
-
-/// Pdeathsig cascade (ADR-004 layer 1, pre-exec arm): called in the child branch of the supervisor's
-/// fork before execve. prctl survives execve (except setugid), and is reset in the child after fork.
-/// The getppid check right after arming: a parent death that already happened does not
-/// retroactively deliver the signal; the immediate getppid check closes that race.
-pub fn armPdeathsigPreExec(parent_pid: i32) void {
-    armPdeathsigOn(parent_pid);
-}
-
 /// Global view of the mmap registry: after spawnBatchWatchdog its copy in the watchdog refers to
 /// the same shared anonymous mapping; the supervisor writes through its own view. An empty view in
 /// the watchdog is impossible: spawn installs it before first use.
@@ -2505,48 +1919,10 @@ var g_wd_pid: i32 = 0;
 
 fn spawnBatchWatchdog(io: std.Io) ?i32 {
     _ = io;
-    const sup_pidfd = pidfdOpen(@intCast(linux.getpid()));
-    if (sup_pidfd < 0) return null; // degraded: no watchdog, containment by layers 1+2 only
-    const wpid_rc = linux.fork();
-    if (linux.errno(wpid_rc) != .SUCCESS) {
-        _ = linux.close(sup_pidfd);
-        return null; // degraded
-    }
-    if (wpid_rc != 0) {
-        // Supervisor: the pidfd is needed only by the watchdog; the watchdog is not a member of the supervisor's
-        // group nor of any worker group; no test waitpids it (not their child); its zombie, if it
-        // died, is acceptable — the runMain defer reaps it on the normal path anyway.
-        _ = linux.close(sup_pidfd);
-        return @intCast(wpid_rc);
-    }
-    // ---- watchdog (the single process; a child of the supervisor) ----
-    // Own group: not in any worker group and not in the supervisor's group.
-    _ = linux.setpgid(0, 0);
-    // Close everything except 0/1/2 and the supervisor's pidfd. The two ranges — [sup_pidfd+1, ∞)
-    // and [3, sup_pidfd) — keep the pidfd itself alive (close_range is inclusive
-    // only within the given range). The watchdog polls this fd for its whole life.
-    _ = linux.close_range(@as(linux.fd_t, @intCast(sup_pidfd + 1)), std.math.maxInt(linux.fd_t), .{ .CLOEXEC = false, .UNSHARE = false });
-    if (sup_pidfd > 3) {
-        _ = linux.close_range(3, @as(linux.fd_t, @intCast(sup_pidfd - 1)), .{ .CLOEXEC = false, .UNSHARE = false });
-    }
-    var pfd: [1]linux.pollfd = .{.{
-        .fd = sup_pidfd,
-        .events = linux.POLL.IN,
-        .revents = 0,
-    }};
-    while (true) {
-        const prc = linux.poll(&pfd, 1, -1);
-        switch (linux.errno(prc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => break, // EBADF etc.: a non-blocking exit without cleanup
-        }
-        if (prc != 0) break; // pidfd readable => the supervisor is dead
-    }
-    // The supervisor is dead: the reader walks the registry, the writer is gone.
-    // This view is the shared MAP_SHARED|MAP_ANONYMOUS mapping; its pages are not in real_addr if g_wd_reg is empty.
-    g_wd_reg.killAll();
-    linux.exit_group(0);
+    // The fork layout and the poll-on-death-fd contract moved into the PAL backend
+    // (pidfd+poll on Linux, kqueue EVFILT_PROC on Darwin); the registry view and the
+    // killAll sweep semantics are identical on both.
+    return pal.impl.spawnBatchWatchdog(g_wd_reg);
 }
 
 /// Zygote teardown: closes the control
@@ -2572,7 +1948,7 @@ fn killAndCloseZygote(
     if (zygote_pid.* > 0) {
         const zpg_rc = linux.syscall1(.getpgid, @as(usize, @intCast(zygote_pid.*)));
         if (linux.errno(zpg_rc) == .SUCCESS and zpg_rc == @as(usize, @intCast(zygote_pid.*))) {
-            killGroup(zygote_pid.*);
+            pal.killGroup(zygote_pid.*);
         }
         _ = linux.kill(zygote_pid.*, linux.SIG.KILL);
         _ = waitPidWithDeadline(zygote_pid.*, monotonicMs() + 3_000);
@@ -2587,79 +1963,22 @@ fn killAndCloseZygote(
     // error), where the Zygote's whole worker tree is already condemned by its pdeathsig
     // cascade; the sweep is the last containment net for that tree. Rolling-path sweeps use
     // `minActiveWorkerStartTicks` instead.
-    killAdoptedOrphans(self_pid, protected, protected, null);
+    pal.impl.killAdoptedOrphans(self_pid, protected, protected, null, g_wd_pid);
 
     // Final selective zombie sweep for anything already reaped-able (zombies adopted at the Zygote's
     // death). Protected (registered) worker zombies stay pinned so active slots never signal a
     // recycled pid. Statuses are not recorded.
-    reapAdoptedChildren(protected);
-}
-
-/// Opens a private nonblocking open file description for the supervisor's own copy of fd 1/2 via
-/// /proc/self/fd: O_NONBLOCK lives on the OFD, so a worker that inherited fd 1/2 and
-/// calls os.set_blocking(1, true) cannot flip the supervisor's writes back to blocking and freeze
-/// supervision on a backpressured pipe. A private OFD (CLOEXEC, never inherited) keeps supervisor
-/// output flags untouchable by workers. The caller's status flags O_APPEND / O_DSYNC / O_SYNC are
-/// carried over from the original OFD (residual). Returns null when the source
-/// flags cannot be read or the sink cannot be reopened (caller then degrades to a plain write on the
-/// original fd). NOTE: only valid for FIFO and character-device sinks — /proc/self/fd refuses
-/// to reopen sockets (ENXIO), and a private OFD on a regular file would get its own file offset and
-/// clobber concurrent writers; `initOutputChannel` performs that classification via fstat first.
-fn openPrivateOutputFd(std_fd: i32) ?linux.fd_t {
-    const fl_rc = linux.fcntl(std_fd, linux.F.GETFL, 0);
-    if (linux.errno(fl_rc) != .SUCCESS) return null;
-    const src_fl: linux.O = @bitCast(@as(u32, @intCast(fl_rc)));
-    var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/self/fd/{d}", .{std_fd}, 0) catch return null;
-    const rc = linux.open(path, .{
-        .ACCMODE = .WRONLY,
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-        .APPEND = src_fl.APPEND,
-        .DSYNC = src_fl.DSYNC,
-        .SYNC = src_fl.SYNC,
-    }, 0);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    return @intCast(rc);
-}
-
-/// Architecture-independent statx(2) size (works identically on x86_64 and aarch64 Linux).
-/// Returns file size in bytes, or 0 on failure (caller degrades: size-0 sorts last in LPT).
-fn statFileSize(path_z: [*:0]const u8) u64 {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path_z, 0, .{ .SIZE = true }, &stx);
-    if (linux.errno(rc) != .SUCCESS) return 0;
-    return stx.size;
-}
-
-/// Architecture-independent statx(2) on an open fd.
-/// Returns the stx_mode bits, or null on failure (caller degrades conservatively).
-fn fstatMode(fd: linux.fd_t) ?u32 {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .MODE = true }, &stx);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    return stx.mode;
-}
-
-/// statx(2) mode bits for a path, or null when the path is absent or cannot be stat'ed.
-/// Symlinks are followed, which is the existence test a runner must apply to its arguments.
-fn statModeBits(path: []const u8) ?u32 {
-    var buf: [4096]u8 = undefined;
-    const pz = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return null;
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, pz.ptr, 0, .{ .TYPE = true, .MODE = true }, &stx);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    return stx.mode;
+    pal.reapAdoptedChildren(protected, g_wd_pid);
 }
 
 pub fn pathExists(path: []const u8) bool {
-    return statModeBits(path) != null;
+    return pal.statModeBits(path) != null;
 }
 
 /// A usable interpreter path: an existing regular file with at least one execute bit set.
 pub fn isExecutableFile(path: []const u8) bool {
-    const mode_bits = statModeBits(path) orelse return false;
-    if (!linux.S.ISREG(mode_bits)) return false;
+    const mode_bits = pal.statModeBits(path) orelse return false;
+    if (!pal.isReg(mode_bits)) return false;
     return (mode_bits & 0o111) != 0;
 }
 
@@ -2700,22 +2019,27 @@ pub fn interpreterAvailable(path: []const u8, path_env: ?[]const u8) bool {
 }
 
 /// Raw O_NONBLOCK status bit (packed-struct form is awkward for masking in tests).
-const O_NONBLOCK_BIT: u32 = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+const O_NONBLOCK_BIT: u32 = pal.O_NONBLOCK_BIT;
 
 /// Classifies an inherited std fd by fstat and builds the right sink-mode channel:
 ///   regular file / block device      -> plain write on the original fd (shared offset + O_APPEND,
 ///                                        no backpressure; never a private OFD, never flag changes)
 /// FIFO / character device -> private NONBLOCK OFD (worker-proof)
-///   socket                           -> original fd + send(MSG_DONTWAIT|MSG_NOSIGNAL), flags
-///                                        untouched (per-call non-blocking)
+///   socket                           -> original fd + per-call nonblocking send flags; the shared
+///                                        O_NONBLOCK state stays untouched
 ///   fstat failure / unknown type     -> conservative plain write on the original fd
 fn initOutputChannel(std_fd: i32) OutChan {
-    const mode_bits = fstatMode(std_fd) orelse return .{ .fd = std_fd, .mode = .plain };
-    if (linux.S.ISREG(mode_bits) or linux.S.ISBLK(mode_bits)) {
+    const mode_bits = pal.fstatMode(std_fd) orelse return .{ .fd = std_fd, .mode = .plain };
+    if (pal.isReg(mode_bits) or pal.isBlk(mode_bits)) {
         return .{ .fd = std_fd, .mode = .plain };
     }
-    if (linux.S.ISFIFO(mode_bits) or linux.S.ISCHR(mode_bits)) {
-        if (openPrivateOutputFd(std_fd)) |pfd| {
+    if (pal.isFifo(mode_bits) or pal.isChr(mode_bits)) {
+        // XNU anonymous pipes have no F_GETPATH vnode and cannot gain a second OFD.
+        // Keep their output on the original fd: .drop would silence `ztest | cat`.
+        if (pal.isFifo(mode_bits) and !pal.outputFdHasPath(std_fd)) {
+            return .{ .fd = std_fd, .mode = .plain };
+        }
+        if (pal.openPrivateOutputFd(std_fd)) |pfd| {
             return .{ .fd = pfd, .mode = .ofd };
         }
         // An unwritable/unre-openable FIFO or tty sink must never degrade to a blocking
@@ -2723,10 +2047,37 @@ fn initOutputChannel(std_fd: i32) OutChan {
         // are dropped and counted instead (the final drop note reports the count).
         return .{ .fd = std_fd, .mode = .drop };
     }
-    if (linux.S.ISSOCK(mode_bits)) {
+    if (pal.isSock(mode_bits)) {
         return .{ .fd = std_fd, .mode = .sock };
     }
     return .{ .fd = std_fd, .mode = .plain };
+}
+
+/// Walks the ancestor chain (up to 4 hops) of cwd, then the default tests dir, looking for a
+/// pyproject.toml that declares [project].name or [tool.poetry].name. Returns the first match
+/// as an owned string; null on any failure (silently skipped by the caller).
+fn detectProjectPackage(gpa: std.mem.Allocator) ?[]u8 {
+    var cwd_buf: [4096]u8 = @splat(0);
+    const cwd_rc = linux.getcwd(&cwd_buf, cwd_buf.len);
+    if (linux.errno(cwd_rc) != .SUCCESS) return null;
+    const cwd_len = std.mem.indexOfScalar(u8, &cwd_buf, 0) orelse cwd_buf.len;
+    var dir_buf: [4096]u8 = undefined;
+    @memcpy(dir_buf[0..cwd_len], cwd_buf[0..cwd_len]);
+    var dir_len = cwd_len;
+    var hops: usize = 0;
+    while (hops < 4 and dir_len >= 1) : (hops += 1) {
+        if (pyfiles.readProjectName(gpa, dir_buf[0..dir_len]) catch null) |name| return name;
+        const cut = std.mem.lastIndexOfScalar(u8, dir_buf[0..dir_len], '/') orelse break;
+        if (cut == 0) {
+            if (dir_len == 1) break;
+            dir_len = 1;
+        } else dir_len = cut;
+    }
+    // Fallback: a project that keeps its tests in a separate root without a top-level pyproject.
+    var tests_buf: [4096]u8 = undefined;
+    const tests_dir = std.fmt.bufPrint(&tests_buf, "{s}/tests", .{cwd_buf[0..cwd_len]}) catch return null;
+    if (pyfiles.readProjectName(gpa, tests_dir) catch null) |name| return name;
+    return null;
 }
 
 fn runMain(init: std.process.Init) !u8 {
@@ -2736,7 +2087,7 @@ fn runMain(init: std.process.Init) !u8 {
     enableChildSubreaper();
     // Output channels by sink type: fstat decides plain (regular file: shared
     // offset, worker writes concatenate), private NONBLOCK OFD (FIFO/tty: worker-proof), or
-    // send(MSG_DONTWAIT|MSG_NOSIGNAL) (socket: per-call non-blocking, flags untouched). The flags of
+    // send(MSG_DONTWAIT|MSG_NBIO|MSG_NOSIGNAL) (socket: per-call non-blocking, flags untouched). The flags of
     // inherited descriptors 1/2 are never modified on any path — no save/restore machinery, so no
     // restore-before-flush race and no shared-NONBLOCK the worker could observe or strip.
     g_out_stdout = initOutputChannel(1);
@@ -2767,7 +2118,7 @@ fn runMain(init: std.process.Init) !u8 {
 
     if (cli.show_help) {
         writeStdout(
-            \\ztest 0.5.1 (Zig 0.17.0) — hermetic test supervisor for Python (pytest-compatible)
+            \\ztest 0.6.0 (Zig 0.17.0) — hermetic test supervisor for Python (pytest-compatible)
             \\Usage: ztest [options] [file_or_dir] [...]
             \\Options:
             \\  -k <expr>               Filter tests by substring/boolean expression
@@ -2779,6 +2130,7 @@ fn runMain(init: std.process.Init) !u8 {
             \\  --engine=native|pytest  Test execution engine (default: native)
             \\  --mode=zygote|exec      Execution mode (default: zygote)
             \\  --preload=<list>        Comma-separated modules to pre-import into the zygote (opt-in)
+            \\  --no-auto-preload       Disable auto preloading of project package and heavy modules
             \\  --python=<path>         Explicit Python 3.11+ interpreter path
             \\  --collect-only, --co    Only collect and print test nodeids
             \\  -s, --no-capture        Disable stdout/stderr capture
@@ -2791,7 +2143,7 @@ fn runMain(init: std.process.Init) !u8 {
         return ExitCode.ok.toU8();
     }
     if (cli.show_version) {
-        writeStdout("ztest 0.5.1 (Zig 0.17.0)\n");
+        writeStdout("ztest 0.6.0 (Zig 0.17.0)\n");
         return ExitCode.ok.toU8();
     }
 
@@ -2848,6 +2200,9 @@ fn runMain(init: std.process.Init) !u8 {
     }
     for (targets.items) |t| {
         discoverTestFiles(gpa, t, &files) catch |err| switch (err) {
+            error.ConfigTooLarge => {
+                return ExitCode.usage_error.toU8();
+            },
             error.TooManyPatterns => {
                 writeStderr("ztest: error: python_files or norecursedirs exceeds 256 patterns\n");
                 return ExitCode.usage_error.toU8();
@@ -2895,7 +2250,7 @@ fn runMain(init: std.process.Init) !u8 {
                 sized[i] = .{ .size = 0, .idx = i };
                 continue;
             };
-            sized[i] = .{ .size = statFileSize(fz), .idx = i };
+            sized[i] = .{ .size = pal.statFileSize(fz), .idx = i };
         }
         std.mem.sort(SizedIdx, sized, {}, struct {
             fn lt(_: void, a: SizedIdx, b: SizedIdx) bool {
@@ -2958,6 +2313,13 @@ fn runMain(init: std.process.Init) !u8 {
     defer gpa.free(shim_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = shim_path, .data = EMBEDDED_SHIM });
     defer std.Io.Dir.deleteFileAbsolute(io, shim_path) catch {};
+    // Keep project detection in a separate, standard-library-only module so the
+    // 450-KiB shim does not grow another TOML walker. Extract it next to the shim
+    // in the private run dir; the zygote loads it lazily and tolerates its absence.
+    const project_detect_path = try std.fmt.allocPrint(gpa, "{s}/_project_detect.py", .{run_dir});
+    defer gpa.free(project_detect_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = project_detect_path, .data = EMBEDDED_PROJECT_DETECT });
+    defer std.Io.Dir.deleteFileAbsolute(io, project_detect_path) catch {};
 
     const ctrl_sock_path = try std.fmt.allocPrint(gpa, "{s}/ctrl.sock", .{run_dir});
     defer gpa.free(ctrl_sock_path);
@@ -3118,22 +2480,43 @@ fn runMain(init: std.process.Init) !u8 {
         const self_pid: i32 = @intCast(linux.getpid());
         // `null` threshold — every slot is empty here (runMain teardown), so there is no
         // live worker domain left to protect.
-        killAdoptedOrphans(self_pid, &.{}, &.{}, null);
-        reapAdoptedChildren(&.{});
+        pal.impl.killAdoptedOrphans(self_pid, &.{}, &.{}, null, g_wd_pid);
+        pal.reapAdoptedChildren(&.{}, g_wd_pid);
     }
 
     if (!exec_mode) {
         var env_map = try init.environ_map.clone(gpa);
         defer env_map.deinit();
         try env_map.put("PYTHONHASHSEED", "0");
-        // The preload gate in the shim. A small suite never amortizes the preload
-        // cost — there it is pure overhead. The shim's default (variable
-        // absent) = preload; a test that really imports a module imports it itself.
-        if (files.items.len <= 8) try env_map.put("ZTEST_PRELOAD_HEAVY", "0");
+        // Auto-preload contract: env (ZTEST_AUTO_PRELOAD=0/1) wins when the flag was not
+        // passed; --no-auto-preload is the CLI override. Default = on.
+        var auto_preload = true;
+        if (init.environ_map.get("ZTEST_AUTO_PRELOAD")) |av| {
+            if (std.mem.eql(u8, av, "0")) auto_preload = false;
+            if (std.mem.eql(u8, av, "1")) auto_preload = true;
+        }
+        if (cli.no_auto_preload) auto_preload = false;
+        try env_map.put("ZTEST_AUTO_PRELOAD", if (auto_preload) "1" else "0");
+
+        // The preload gate in the shim. Threshold lowered to 4 (was 8): a suite with
+        // more than four discovered files amortizes the prewarm cost. The shim's default
+        // (variable absent) = preload; a test that really imports a module imports it itself.
+        if (files.items.len <= 4) try env_map.put("ZTEST_PRELOAD_HEAVY", "0");
         // Third-party preload is opt-in: `--preload a,b,c` pins the list for the
         // zygote. An exported ZTEST_PRELOAD_PKGS reaches the zygote through the
         // inherited env without the flag; the explicit flag wins.
         if (cli.preload_pkgs.len > 0) try env_map.put("ZTEST_PRELOAD_PKGS", cli.preload_pkgs);
+        // Project-package autodetect: only when auto-preload is enabled and ZTEST_PROJECT_PKG
+        // was not already exported by the user (user env always wins). The detector walks
+        // ancestors of the cwd (and the default `tests` target) to a depth of 4, reading
+        // [project].name then [tool.poetry].name from pyproject.toml. Any failure is a
+        // silent skip, never a run abort.
+        if (auto_preload and init.environ_map.get("ZTEST_PROJECT_PKG") == null) {
+            if (detectProjectPackage(gpa)) |pkg| {
+                defer gpa.free(pkg);
+                try env_map.put("ZTEST_PROJECT_PKG", pkg);
+            }
+        }
         try env_map.put("ZTEST_ENGINE", if (engine_pytest) "pytest" else "native");
 
         const z_argv = [_][]const u8{ py_bin, shim_path, "--zygote", ctrl_sock_path, slot_sock_paths[0], sup_pid_str };
@@ -3258,13 +2641,13 @@ fn runMain(init: std.process.Init) !u8 {
                 // error/timeout) must be dead before REAP so the Zygote's bounded
                 // handler never stalls on a hung-after-close worker.
                 if (worker_pid > 0) {
-                    killGroup(worker_pid);
+                    pal.killGroup(worker_pid);
                     _ = linux.kill(worker_pid, linux.SIG.KILL);
                 }
             }
 
             // ADR-004 layer 3: killGroup + unregister before reap.
-            if (worker_pid > 0) killGroup(worker_pid);
+            if (worker_pid > 0) pal.killGroup(worker_pid);
             if (worker_pid > 0 and g_wd_reg.slots.len > 0) {
                 g_wd_reg.unregister(worker_pid);
             }
@@ -3406,7 +2789,7 @@ fn runMain(init: std.process.Init) !u8 {
                     total_crashed +|= 1;
                     total_failed +|= 1;
                     const st_u32: u32 = if (raw_status >= 0) @bitCast(raw_status) else 0;
-                    const sig: u32 = if (raw_status >= 0 and linux.W.IFSIGNALED(st_u32)) @backingInt(linux.W.TERMSIG(st_u32)) else 0;
+                    const sig: u32 = if (raw_status >= 0 and linux.W.IFSIGNALED(st_u32)) @intCast(@backingInt(linux.W.TERMSIG(st_u32))) else 0;
                     if (cli.llm_mode) {
                         const line = try std.fmt.allocPrint(gpa, "{{\"t\":\"crash\",\"file\":{f},\"signal\":{d},\"raw_status\":{d},\"timed_out\":{s}}}\n", .{ std.json.fmt(file_path, .{}), sig, raw_status, if (summary.timed_out) "true" else "false" });
                         defer gpa.free(line);
@@ -3441,7 +2824,7 @@ fn runMain(init: std.process.Init) !u8 {
                     if (pidInList(sweep_protected.items, s.aw.worker_pid)) continue;
                     try sweep_protected.append(gpa, s.aw.worker_pid);
                 }
-                reapAdoptedChildren(sweep_protected.items);
+                pal.reapAdoptedChildren(sweep_protected.items, g_wd_pid);
                 // STARTTIME threshold: sparing `sweep_protected` is safe, but "not protected"
                 // is not a licence to kill — a live sibling's helper looks exactly like an
                 // escapee of the finished slot. A descendant always starts after its ancestor,
@@ -3450,7 +2833,7 @@ fn runMain(init: std.process.Init) !u8 {
                 // per live slot and returns `null` when nothing is live, or `0` when some live
                 // worker's starttime is unreadable (kill nothing).
                 const sweep_older_than = minActiveWorkerStartTicks(&slots);
-                killAdoptedOrphans(self_pid, sweep_protected.items, protected_pids.items, sweep_older_than);
+                pal.impl.killAdoptedOrphans(self_pid, sweep_protected.items, protected_pids.items, sweep_older_than, g_wd_pid);
             }
         }
 
@@ -3475,7 +2858,7 @@ fn runMain(init: std.process.Init) !u8 {
             var worker_pid: i32 = 0;
 
             if (!exec_mode) {
-                const tcount = countProcTasks(zygote_pid) catch 0;
+                const tcount = pal.countProcTasks(zygote_pid) catch 0;
                 if (tcount != 1) {
                     writeStderr("ztest: Zygote thread invariant violated, switching to Clean-Spawn\n");
                     killAndCloseZygote(&zygote_conn_fd, &zygote_pid, protected_pids.items);
@@ -3654,7 +3037,7 @@ fn runMain(init: std.process.Init) !u8 {
                             aw.summary.ipc_error = true;
                             aw.summary.got_file_done = false;
                             if (aw.worker_pid > 0) {
-                                killGroup(aw.worker_pid);
+                                pal.killGroup(aw.worker_pid);
                                 _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
                             }
                             aw.eof = true;
@@ -3725,7 +3108,7 @@ fn runMain(init: std.process.Init) !u8 {
                     }
                     aw.exit_deadline_ms = 0;
                     if (aw.worker_pid > 0) {
-                        killGroup(aw.worker_pid);
+                        pal.killGroup(aw.worker_pid);
                     }
                     continue;
                 }
@@ -3753,7 +3136,7 @@ fn runMain(init: std.process.Init) !u8 {
                                     aw.summary.ipc_error = true;
                                     aw.summary.got_file_done = false;
                                     if (aw.worker_pid > 0) {
-                                        killGroup(aw.worker_pid);
+                                        pal.killGroup(aw.worker_pid);
                                         _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
                                     }
                                     aw.eof = true;
@@ -3828,7 +3211,7 @@ fn runMain(init: std.process.Init) !u8 {
             const aw = &slot.aw;
             if (aw.eof) {
                 if (aw.exit_deadline_ms > 0 and aw.worker_pid > 0 and now_ms >= aw.exit_deadline_ms) {
-                    killGroup(aw.worker_pid);
+                    pal.killGroup(aw.worker_pid);
                     _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
                     aw.exit_deadline_ms = 0;
                     if (aw.worker_pidfd >= 0) {
@@ -3860,7 +3243,7 @@ fn runMain(init: std.process.Init) !u8 {
                         aw.summary.ipc_error = true;
                         aw.summary.got_file_done = false;
                         if (aw.worker_pid > 0) {
-                            killGroup(aw.worker_pid);
+                            pal.killGroup(aw.worker_pid);
                             _ = linux.kill(aw.worker_pid, linux.SIG.KILL);
                         }
                         aw.eof = true;
@@ -3891,13 +3274,13 @@ fn runMain(init: std.process.Init) !u8 {
         defer sweep_protected.deinit(gpa);
         try sweep_protected.appendSlice(gpa, protected_pids.items);
         if (zygote_pid > 0) try sweep_protected.append(gpa, zygote_pid);
-        reapAdoptedChildren(sweep_protected.items);
+        pal.reapAdoptedChildren(sweep_protected.items, g_wd_pid);
         // Quiescent point (next_file == total and running == 0) — no worker of this
         // run is alive, so there is no live sibling domain to protect: `null` threshold selects
         // the kill-everything-not-protected semantics (this is the containment
         // catch-all that removes whatever a starttime-guarded per-slot sweep had to spare
         // earlier in the run, e.g. a live sibling's daemon that outlived its file).
-        killAdoptedOrphans(self_pid, sweep_protected.items, protected_pids.items, null);
+        pal.impl.killAdoptedOrphans(self_pid, sweep_protected.items, protected_pids.items, null, g_wd_pid);
     }
 
     const dur_ms: i64 = monotonicMs() - start_ms;
@@ -4044,8 +3427,9 @@ test "Positive Proof of Pass rejects signals, missing FILE_DONE, negative status
 }
 
 test "countProcTasks via linux.getdents64(c_uint) and bufPrintSentinel" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const self_pid: i32 = @intCast(linux.getpid());
-    const tasks = try countProcTasks(self_pid);
+    const tasks = try pal.countProcTasks(self_pid);
     try std.testing.expect(tasks >= 1);
 }
 
@@ -4168,6 +3552,7 @@ test "reapChildBounded never hangs on a non-child PID" {
 }
 
 test "reapAdoptedChildren keeps protected zombies pinned, reaps unregistered without recording status" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const child = linux.fork();
     if (child == 0) linux.exit_group(42);
     const child_pid: i32 = @intCast(child);
@@ -4183,14 +3568,14 @@ test "reapAdoptedChildren keeps protected zombies pinned, reaps unregistered wit
 
     // Protected: sweep must not reap it — the zombie stays pinned.
     const prot = [_]i32{child_pid};
-    reapAdoptedChildren(&prot);
+    pal.reapAdoptedChildren(&prot, g_wd_pid);
     var sib2: [128]u8 align(8) = @splat(0);
     const prc2 = linux.syscall5(.waitid, 1, @as(usize, @intCast(child_pid)), @intFromPtr(&sib2), linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, 0);
     try std.testing.expect(linux.errno(prc2) == .SUCCESS);
     try std.testing.expectEqual(child_pid, std.mem.readInt(i32, sib2[16..20], .little));
 
     // Unprotected: sweep reaps it for real (without recording the status anywhere).
-    reapAdoptedChildren(&.{});
+    pal.reapAdoptedChildren(&.{}, g_wd_pid);
     // The zombie is gone: a targeted WNOWAIT peek now returns ECHILD/no result.
     var sib3: [128]u8 align(8) = @splat(0);
     const prc3 = linux.syscall5(.waitid, 1, @as(usize, @intCast(child_pid)), @intFromPtr(&sib3), linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, 0);
@@ -4243,14 +3628,17 @@ test "finalizeSlotEof kills workers that lost IPC before FILE_DONE" {
     try std.testing.expect(linux.errno(linux.kill(pidB, @fromBackingInt(@intCast(0)))) == .SUCCESS); // still alive
     // Firing the one-shot deadline early by hand: kill succeeds and the deadline is cleared once.
     awB.exit_deadline_ms = monotonicMs() - 1;
-    killGroup(pidB);
+    pal.killGroup(pidB);
     _ = linux.kill(pidB, linux.SIG.KILL);
     awB.exit_deadline_ms = 0;
     _ = reapChildBounded(pidB, monotonicMs() + 2_000);
 }
 
 test "openPrivateOutputFd yields an independent NONBLOCK OFD" {
-    const pfd = openPrivateOutputFd(1) orelse return; // environment without /proc: degraded, skip
+    // Darwin regular files do not retain O_NONBLOCK; production uses this
+    // path only for FIFOs and character devices, never for regular files.
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    const pfd = pal.openPrivateOutputFd(1) orelse return; // environment without /proc: degraded, skip
     defer _ = linux.close(pfd);
     try std.testing.expect(pfd != 1);
     const fl_rc = linux.fcntl(pfd, linux.F.GETFL, 0);
@@ -4260,6 +3648,7 @@ test "openPrivateOutputFd yields an independent NONBLOCK OFD" {
 }
 
 test "private output OFD preserves caller's O_APPEND" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
     // Unit test of openPrivateOutputFd itself (used for FIFO/tty sinks in production; a regular
     // file is used here only as a hermetic writable sink): re-opening via /proc/self/fd must carry
     // the source's O_APPEND so append semantics are never clobbered by the private copy.
@@ -4272,7 +3661,7 @@ test "private output OFD preserves caller's O_APPEND" {
     defer _ = linux.unlink(path);
     // Only fd 1/2 semantics matter in production, but openPrivateOutputFd works for any fd via
     // /proc/self/fd/N — exercising it with a private high fd keeps the test hermetic.
-    const pfd = openPrivateOutputFd(src_fd) orelse return; // environment without /proc: degraded, skip
+    const pfd = pal.openPrivateOutputFd(src_fd) orelse return; // environment without /proc: degraded, skip
     defer _ = linux.close(pfd);
     try std.testing.expect(pfd != src_fd);
     const fl_rc = linux.fcntl(pfd, linux.F.GETFL, 0);
@@ -4289,6 +3678,9 @@ test "private output OFD preserves caller's O_APPEND" {
 }
 
 test "regular-file sink stays plain, shared offset, interleaved writes intact" {
+    // Reopening /dev/fd/N for a regular file starts at offset zero on Darwin;
+    // this test specifically asserts the Linux procfd private-OFD behavior.
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
     // A private OFD on a regular file without O_APPEND would get its own f_pos=0
     // and clobber concurrent writers. The sink-mode redesign keeps regular files on the original
     // fd with the shared file offset, so supervisor and interleaved plain writes concatenate.
@@ -4325,7 +3717,7 @@ test "regular-file sink stays plain, shared offset, interleaved writes intact" {
 test "socket sink uses MSG_DONTWAIT, never blocks, never flips flags" {
     // A fallback that SETFLs the shared socket O_NONBLOCK and restores flags
     // before the final flush lets a blocking write hang the supervisor. The sock sink mode
-    // writes with send(MSG_DONTWAIT|MSG_NOSIGNAL): per-call non-blocking, socket flags untouched.
+    // writes with send(MSG_DONTWAIT|MSG_NBIO|MSG_NOSIGNAL): per-call non-blocking, socket flags untouched.
     var fds: [2]linux.fd_t = undefined;
     const sp_rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds);
     try std.testing.expect(linux.errno(sp_rc) == .SUCCESS);
@@ -4338,21 +3730,27 @@ test "socket sink uses MSG_DONTWAIT, never blocks, never flips flags" {
     try std.testing.expect(linux.errno(fl_before_rc) == .SUCCESS);
     const fl_before: linux.O = @bitCast(@as(u32, @intCast(fl_before_rc)));
     try std.testing.expect(!fl_before.NONBLOCK); // caller's socket is blocking and must stay so
-
     // Fill the socket buffer with per-call non-blocking sends (flags still untouched).
     var filler: [4096]u8 = @splat(0x41);
     var filled: usize = 0;
-    while (true) {
-        const rc = linux.sendto(a_fd, &filler, filler.len, MSG_DONTWAIT | MSG_NOSIGNAL, null, 0);
-        if (linux.errno(rc) != .SUCCESS) break; // EAGAIN: buffer full
+    var saw_eagain = false;
+    while (filled <= (64 << 20)) {
+        const rc = linux.sendto(a_fd, &filler, filler.len, MSG_DONTWAIT | MSG_NBIO | MSG_NOSIGNAL, null, 0);
+        const send_errno = linux.errno(rc);
+        if (send_errno == .AGAIN) {
+            saw_eagain = true;
+            break;
+        }
+        try std.testing.expect(send_errno == .SUCCESS);
+        try std.testing.expect(rc > 0); // zero progress would otherwise spin forever
         filled += rc;
-        if (filled > (1 << 20)) break; // safety cap
     }
     try std.testing.expect(filled > 0);
+    try std.testing.expect(saw_eagain); // the fixture must really be backpressured, not merely capped
 
     var chan = initOutputChannel(a_fd);
     try std.testing.expectEqual(OutSinkMode.sock, chan.mode);
-    try std.testing.expectEqual(a_fd, chan.fd); // original fd: /proc/self/fd cannot reopen sockets
+    try std.testing.expectEqual(a_fd, chan.fd); // per-call flags preserve the shared socket state
     defer chan.backlog.deinit(std.heap.page_allocator);
 
     // A write into a full socket must return immediately (MSG_DONTWAIT -> EAGAIN -> backlog).
@@ -4402,12 +3800,36 @@ test "socket sink uses MSG_DONTWAIT, never blocks, never flips flags" {
     try std.testing.expectEqual(@as(u32, @intCast(fl_before_rc)), @as(u32, @intCast(fl_after_rc)));
 }
 
+/// Opens a real filesystem FIFO with a blocking write end. Unlike an anonymous XNU pipe,
+/// this fixture supports both F_GETPATH and fchmod, matching the named-FIFO production path.
+fn openNamedTestFifo(path: [*:0]const u8) ![2]linux.fd_t {
+    _ = linux.unlink(path);
+    const mkrc = linux.mknod(path, 0o010000 | 0o600, 0); // S_IFIFO | 0600 == mkfifo(path, 0600)
+    if (linux.errno(mkrc) != .SUCCESS) return error.TestUnexpectedResult;
+
+    const rrc = linux.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rrc) != .SUCCESS) return error.TestUnexpectedResult;
+    const rfd: linux.fd_t = @intCast(rrc);
+    errdefer _ = linux.close(rfd);
+
+    const wrc = linux.open(path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    if (linux.errno(wrc) != .SUCCESS) return error.TestUnexpectedResult;
+    const wfd: linux.fd_t = @intCast(wrc);
+    errdefer _ = linux.close(wfd);
+
+    const fl_rc = linux.fcntl(wfd, linux.F.GETFL, 0);
+    if (linux.errno(fl_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    const clear_rc = linux.fcntl(wfd, linux.F.SETFL, @as(usize, @as(u32, @intCast(fl_rc)) & ~O_NONBLOCK_BIT));
+    if (linux.errno(clear_rc) != .SUCCESS) return error.TestUnexpectedResult;
+    return .{ rfd, wfd };
+}
+
 test "FIFO sink opens a private NONBLOCK OFD, source fd flags untouched" {
-    // FIFO/tty sinks keep the worker-proof private OFD; the original pipe fd must keep its
-    // blocking flags so a worker inheriting it observes no flag change from the supervisor.
-    var fds: [2]linux.fd_t = undefined;
-    const prc = linux.pipe2(&fds, .{ .CLOEXEC = true });
-    try std.testing.expect(linux.errno(prc) == .SUCCESS);
+    // A named FIFO exercises a genuinely independent OFD on both /proc/self/fd and F_GETPATH.
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/ztest-fifo-{d}-ofd", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path.ptr);
+    const fds = try openNamedTestFifo(path.ptr);
     const rfd = fds[0];
     const wfd = fds[1];
     defer _ = linux.close(rfd);
@@ -4420,7 +3842,6 @@ test "FIFO sink opens a private NONBLOCK OFD, source fd flags untouched" {
 
     var chan = initOutputChannel(wfd);
     defer chan.backlog.deinit(std.heap.page_allocator);
-    if (chan.mode == .plain) return; // environment without /proc/self/fd re-opening: degraded, skip
     try std.testing.expectEqual(OutSinkMode.ofd, chan.mode);
     try std.testing.expect(chan.fd != wfd); // private OFD, not the inherited one
     const fl_priv_rc = linux.fcntl(chan.fd, linux.F.GETFL, 0);
@@ -4439,15 +3860,17 @@ test "unwritable fifo sink degrades to .drop, write never blocks" {
     // stripped via fchmod) must become a .drop channel — writes are counted and discarded.
     // A blocking write on the original fd would hang supervision forever on an
     // unwritable pipe, so the sink never falls back to writing it.
-    var fds: [2]linux.fd_t = undefined;
-    const prc = linux.pipe2(&fds, .{ .CLOEXEC = true });
-    try std.testing.expect(linux.errno(prc) == .SUCCESS);
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/ztest-fifo-{d}-drop", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path.ptr);
+    const fds = try openNamedTestFifo(path.ptr);
     const rfd = fds[0];
     const wfd = fds[1];
     defer _ = linux.close(rfd);
     defer _ = linux.close(wfd);
 
-    _ = linux.fchmod(wfd, 0o400); // owner read-only: /proc/self/fd WRONLY reopen now fails EACCES
+    const chmod_rc = linux.fchmod(wfd, 0o400); // a named FIFO really becomes read-only on XNU too
+    try std.testing.expect(linux.errno(chmod_rc) == .SUCCESS);
     var chan = initOutputChannel(wfd);
     defer chan.backlog.deinit(std.heap.page_allocator);
     try std.testing.expectEqual(OutSinkMode.drop, chan.mode);
@@ -4614,6 +4037,7 @@ fn procPpidOf(pid: i32) ?i32 {
 }
 
 test "killAdoptedOrphans spares protected workers' pgrp (watchdog survival), kills setsid escapees" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     // Regression guard: a double-forked watchdog of a live worker is adopted by the
     // subreaper (ppid == self) while living in the worker's process group. A sweep without
     // the pgrp filter kills it, silently stripping the worker's supervisor-death protection. The
@@ -4737,7 +4161,7 @@ test "killAdoptedOrphans spares protected workers' pgrp (watchdog survival), kil
     // must survive; the setsid escapee (adopted, own pgrp) must DIE.
     // `null` threshold on purpose — this test pins the protected-side filters (PID/pgrp);
     // the starttime guard is covered by its own dedicated test.
-    killAdoptedOrphans(self_pid, &.{w_pid}, &.{w_pid}, null);
+    pal.impl.killAdoptedOrphans(self_pid, &.{w_pid}, &.{w_pid}, null, g_wd_pid);
 
     // Worker alive, watchdog alive.
     try std.testing.expect(linux.errno(linux.kill(w_pid, @fromBackingInt(@intCast(0)))) == .SUCCESS);
@@ -4758,7 +4182,7 @@ test "killAdoptedOrphans spares protected workers' pgrp (watchdog survival), kil
     }
 
     // Cleanup: W and the watchdog share one process group.
-    killGroup(w_pid);
+    pal.killGroup(w_pid);
     var st_w: i32 = 0;
     var st_g: i32 = 0;
     _ = linux.wait4(w_pid, &st_w, 0, null);
@@ -4885,13 +4309,14 @@ fn waitForReparentToSelf(pid: i32) bool {
 
 /// SIGKILL a process-group leader (group + leader) and reap it as our own child.
 fn killAndReapChild(pid: i32) void {
-    killGroup(pid);
+    pal.killGroup(pid);
     _ = linux.kill(pid, linux.SIG.KILL);
     var st: i32 = 0;
     _ = linux.wait4(pid, &st, 0, null);
 }
 
 test "starttime-guarded per-slot sweep spares a LIVE sibling's setsid daemon, removes provably-finished leftovers per slot, and sweeps everything at quiescence" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     // The hazard: under the rolling dispatcher the per-slot orphan sweep runs
     // while other files are still executing, and an adopted `setsid` daemon of a live sibling is
     // indistinguishable from an escapee of the finished file by PID/pgrp alone. The guard under
@@ -4904,7 +4329,7 @@ test "starttime-guarded per-slot sweep spares a LIVE sibling's setsid daemon, re
     // (0) Index sanity: the last-')' parser and the naive 22nd field must agree, otherwise the
     //     whole guard would read (and compare) the wrong column.
     {
-        const robust = procStartTimeTicks(self_pid) orelse return error.TestUnexpectedResult;
+        const robust = pal.procStartTimeTicks(self_pid) orelse return error.TestUnexpectedResult;
         const naive = naiveStatStartTimeTicks(self_pid) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(naive, robust);
         try std.testing.expect(robust > 0);
@@ -4925,13 +4350,13 @@ test "starttime-guarded per-slot sweep spares a LIVE sibling's setsid daemon, re
     try std.testing.expect(s_pid > 0);
     try std.testing.expect(waitForReparentToSelf(s_pid));
 
-    const w_ticks = procStartTimeTicks(w_pid) orelse return error.TestUnexpectedResult;
-    const s_ticks = procStartTimeTicks(s_pid) orelse return error.TestUnexpectedResult;
+    const w_ticks = pal.procStartTimeTicks(w_pid) orelse return error.TestUnexpectedResult;
+    const s_ticks = pal.procStartTimeTicks(s_pid) orelse return error.TestUnexpectedResult;
     try std.testing.expect(w_ticks <= s_ticks); // a descendant never predates its ancestor
 
     // (3) Guard direction "spare": threshold = the live sibling's starttime. S is not strictly
     //     older than W, i.e. it may be W's own descendant -> the sweep must not touch it (nor W).
-    killAdoptedOrphans(self_pid, &.{w_pid}, &.{w_pid}, w_ticks);
+    pal.impl.killAdoptedOrphans(self_pid, &.{w_pid}, &.{w_pid}, w_ticks, g_wd_pid);
     try std.testing.expect(procAliveG(s_pid));
     try std.testing.expect(procAliveG(w_pid));
 
@@ -4945,9 +4370,9 @@ test "starttime-guarded per-slot sweep spares a LIVE sibling's setsid daemon, re
     sleepMs(50); // next jiffy: starttime(worker 2) > starttime(S)
     const w2_pid = forkSleepingPgrpLeader() orelse return error.TestUnexpectedResult;
     defer killAndReapChild(w2_pid);
-    const w2_ticks = procStartTimeTicks(w2_pid) orelse return error.TestUnexpectedResult;
+    const w2_ticks = pal.procStartTimeTicks(w2_pid) orelse return error.TestUnexpectedResult;
     try std.testing.expect(s_ticks < w2_ticks);
-    killAdoptedOrphans(self_pid, &.{w2_pid}, &.{w2_pid}, w2_ticks);
+    pal.impl.killAdoptedOrphans(self_pid, &.{w2_pid}, &.{w2_pid}, w2_ticks, g_wd_pid);
     try std.testing.expect(waitUntilDead(s_pid));
     try std.testing.expect(procAliveG(w2_pid)); // the live sibling's domain is untouched
 
@@ -4955,7 +4380,7 @@ test "starttime-guarded per-slot sweep spares a LIVE sibling's setsid daemon, re
     //     kill-everything-not-protected semantics apply — a finished worker's daemon dies on this sweep, not at the end of the run.
     const s2_pid = forkSetsidOrphanAnnounced() orelse return error.TestUnexpectedResult;
     try std.testing.expect(waitForReparentToSelf(s2_pid));
-    killAdoptedOrphans(self_pid, &.{w2_pid}, &.{w2_pid}, null);
+    pal.impl.killAdoptedOrphans(self_pid, &.{w2_pid}, &.{w2_pid}, null, g_wd_pid);
     try std.testing.expect(waitUntilDead(s2_pid));
 }
 
@@ -5380,6 +4805,7 @@ test "ADR-004: PgidRegistry overflow is fail-open (documented)" {
 }
 
 test "ADR-004: watchdog integration — mock supervisor death kills sleeping worker groups" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     // Topology: the test process forks a mock supervisor. The mock creates the
     // pgid registry, forks two sleeping worker process groups (group A = a
     // leader plus an in-group member), registers both pgids, starts the run
@@ -5479,8 +4905,8 @@ test "ADR-004: orphan sweep spares the run watchdog (g_wd_pid exclusion)" {
 
     const self_pid: i32 = @intCast(linux.getpid());
     // Empty exclude/protected: the only adopted candidate is our "watchdog".
-    killAdoptedOrphans(self_pid, &.{}, &.{}, null);
-    reapAdoptedChildren(&.{});
+    pal.impl.killAdoptedOrphans(self_pid, &.{}, &.{}, null, g_wd_pid);
+    pal.reapAdoptedChildren(&.{}, g_wd_pid);
     // The watchdog must survive both sweeps (kill sig=0 — a pure existence check).
     const alive_rc = linux.syscall2(.kill, @intCast(child_pid), 0);
     try std.testing.expect(linux.errno(alive_rc) == .SUCCESS);

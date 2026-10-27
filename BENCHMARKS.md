@@ -4,7 +4,7 @@ ztest is measured against stock pytest on real open-source suites in isolated cl
 
 All ratios are **pytest/ztest**: a wall ratio above 1.0 means ztest finished faster; a peak-PSS ratio above 1.0 means ztest used less memory. A PSS ratio of 0.555 means ztest's median peak footprint is 1/0.555 ≈ 1.8× pytest's — ztest used more memory. Memory ratios against `pytest -n4` are the other way round and always labelled as such.
 
-v0.5.1 changes reporting and shim parity, not the supervisor or the worker model, so the numbers below were measured on 0.5.0 and still describe the current release; the parity counts in Section 3 are the v0.5.1 ones.
+v0.5.1 changed reporting and shim parity, not the supervisor or worker model. v0.6.0 adds the Darwin backend and modular shim sources but does not rerun this Linux stand. The numbers below remain Linux-only measurements from 0.5.0; the parity counts in Section 3 are the v0.5.1 ones and are not presented as Darwin results.
 
 ## Method
 

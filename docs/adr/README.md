@@ -11,5 +11,5 @@ original numbers.
   layers, what each covers, and where they overlap on purpose.
 - [ADR-005](ADR-005-unittest-delegation.md) — delegating the
   `unittest.TestCase` lifecycle to the real runner instead of imitating it.
-- [ADR-006](ADR-006-layout.md) — repository layout: why the shim is one file
-  and how `main.zig` is split.
+- [ADR-006](ADR-006-layout.md) — modular shim sources, one embedded runtime
+  bundle (accepted v2), and the dependency-weight rule for `main.zig`.

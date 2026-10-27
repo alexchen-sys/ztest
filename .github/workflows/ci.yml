@@ -13,196 +13,260 @@ jobs:
         python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
-
       - name: Native test suite
         run: zig build test
-
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
       - name: Install pytest
         run: pip install "pytest>=9,<10"
-
       - name: Behavioral gate (OSS regression fixtures)
         run: ZTEST_BIN=zig-out/bin/ztest python3 -m pytest tests/test_oss_regressions.py -q
-
-      # Pure-Python regression tests for the wheel builder: ELF architecture
-      # identity (aarch64 wheel must not carry an x86_64 payload), filename/tag
-      # parsing, and fail-closed verify_wheel. No Zig build involved.
-      - name: Wheel builder regression tests
-        run: python3 -m pytest scripts/test_build_wheels.py -q
-
+      - name: Packaging and installer regression tests
+        run: |
+          python3 -m pytest scripts/test_build_wheels.py -q
+          python3 -m unittest scripts.test_native_artifact scripts.test_bundle_shim scripts.test_installer -v
       - name: Docs cross-check (invariant keys and links)
         run: python3 scripts/check_docs.py
-
       - name: Smoke run
         run: |
           zig-out/bin/ztest --version
           zig-out/bin/ztest --collect-only tests/fixtures/python_files/tests
 
-  # Static musl artifacts must be sterile: no build-host paths, no dynamic
-  # interpreter, no debug sections. Every check below is a hard gate — a release
-  # that leaks `/home/...`, `/mnt/...`, `/opt/...` or a zig cache path into
-  # `strings` fails CI. Released binaries also refuse to contain `ReleaseFast`
-  # builds: README and BENCHMARKS describe — and measure — a `ReleaseSafe`
-  # binary, so the published artifacts must be the same configuration.
-  musl-static:
-    runs-on: ubuntu-24.04
+  # Static musl and Darwin artifacts are built from the same ReleaseSafe source.
+  # macOS jobs run on real Darwin: Mach-O headers are also checked during wheel
+  # assembly, but codesign/otool and native behavioral tests require Apple tools.
+  static-build:
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - runner: ubuntu-24.04
+            os: linux
+            arch: x86_64
             target: x86_64-linux-musl
-          - arch: aarch64
+            native: true
+          - runner: ubuntu-24.04
+            os: linux
+            arch: aarch64
             target: aarch64-linux-musl
+            native: false
+          - runner: macos-15-intel
+            os: macos
+            arch: x86_64
+            target: x86_64-macos
+            native: true
+          - runner: macos-15
+            os: macos
+            arch: arm64
+            target: aarch64-macos
+            native: true
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Zig 0.17.0
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-
-      - name: Build static binary (${{ matrix.arch }})
+      - name: Build release binary (${{ matrix.os }}/${{ matrix.arch }})
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -p "zig-out-${{ matrix.arch }}"
+      - name: Native test suite
+        if: matrix.native
+        timeout-minutes: 8
+        run: zig build test -Dtarget=${{ matrix.target }}
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Architecture and file format
         run: |
-          set -euo pipefail
-          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -p "zig-out-${{ matrix.arch }}"
-          ls -l "zig-out-${{ matrix.arch }}/bin/ztest"
-
-      - name: Linkage check (must be fully static)
+          BIN="zig-out-${{ matrix.arch }}/bin/ztest"
+          python3 scripts/native_artifact.py "$BIN" --target "${{ matrix.os }}-${{ matrix.arch }}"
+          file "$BIN"
+      - name: Static linkage check (Linux only)
+        if: matrix.os == 'linux'
         run: |
           set -euo pipefail
           BIN="zig-out-${{ matrix.arch }}/bin/ztest"
           file "$BIN" | tee /dev/stderr | grep -q "statically linked"
           if ldd "$BIN" 2>&1 | grep -q "=>"; then
             echo "::error::${{ matrix.arch }} binary is dynamically linked"
-            ldd "$BIN"
             exit 1
           fi
-
-      - name: Debug-section check (must be stripped)
+      - name: Darwin signature and system framework checks
+        if: matrix.os == 'macos'
+        run: |
+          BIN="zig-out-${{ matrix.arch }}/bin/ztest"
+          # Zig adhoc-signs arm64 Mach-O by default (required on Apple Silicon),
+          # but x86_64-macos output is unsigned. Sign it explicitly before the
+          # strict verification gate so the check exercises a signed artifact.
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            codesign --sign - --force "$BIN"
+          fi
+          python3 scripts/native_artifact.py "$BIN" --target "macos-${{ matrix.arch }}" --codesign --frameworks
+      - name: Debug-section check (Linux only)
+        if: matrix.os == 'linux'
         run: |
           set -euo pipefail
           BIN="zig-out-${{ matrix.arch }}/bin/ztest"
           if readelf -S "$BIN" | grep -qE '\.debug_(info|line|str)'; then
-            echo "::error::debug sections present in ${{ matrix.arch }} release binary"
             readelf -S "$BIN" | grep -E '\.debug_' || true
             exit 1
           fi
-          file "$BIN" | grep -qiE 'stripped|no section headers' || {
-            echo "::error::$BIN does not report as stripped"
-            exit 1
-          }
-
-      - name: Sterility check (no build-host paths in strings)
+          file "$BIN" | grep -qiE 'stripped|no section headers'
+      - name: Sterility check
         run: |
-          set -euo pipefail
           BIN="zig-out-${{ matrix.arch }}/bin/ztest"
-          # Occurrence-level scan, not a line filter: legal runtime literals
-          # (/tmp/ztest_{d}_{d}_{x}, bare `zig-cache`) and a real host path can
-          # share one `strings` line, so a `grep -v` would either fail on the
-          # legal literals or hide the leak. The rules and their self-controls
-          # (11 leak / 10 clean cases, including that merged-rodata line) live in
-          # scripts/check_sterility.py; the self-test runs before the scan.
           python3 scripts/check_sterility.py --self-test
           python3 scripts/check_sterility.py "$BIN"
-
-      - name: Smoke run (native arch only)
-        if: matrix.arch == 'x86_64'
+      - name: Behavioral gate and smoke (native targets)
+        if: matrix.native
         run: |
-          set -euo pipefail
           BIN="zig-out-${{ matrix.arch }}/bin/ztest"
+          ZTEST_BIN="$BIN" python3 -m pip install --quiet "pytest>=9,<10"
+          ZTEST_BIN="$BIN" python3 -m pytest tests/test_oss_regressions.py -q
           "$BIN" --version
           "$BIN" --collect-only tests/fixtures/python_files/tests
-
-      - name: Upload static binary
+      - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
-          name: ztest-static-${{ matrix.arch }}
+          name: ztest-static-${{ matrix.os }}-${{ matrix.arch }}
           path: zig-out-${{ matrix.arch }}/bin/ztest
           if-no-files-found: error
 
-  # Wheels are assembled from the static binaries above, then installed for real
-  # into a throwaway venv: `pip install *.whl && ztest --version` must just work.
-  wheels:
+  bundle-check:
     runs-on: ubuntu-24.04
-    needs: [musl-static]
-    env:
-      ZTEST_VERSION: "0.5.1"
+    needs: build-and-test
     steps:
       - uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Verify generated shim bundle is fresh
+        run: python3 scripts/bundle_shim.py --check
 
-      - name: Download static binaries
+  wheels-linux:
+    runs-on: ubuntu-24.04
+    needs: [static-build]
+    env:
+      ZTEST_VERSION: "0.6.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download Linux binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: ztest-static-*
+          pattern: ztest-static-linux-*
           path: artifacts
-
-      - name: Assemble release tarballs and checksums
+      - name: Assemble Linux tarballs
         run: |
           set -euo pipefail
           mkdir -p dist
           for arch in x86_64 aarch64; do
             stage="$(mktemp -d)"
-            install -m 0755 "artifacts/ztest-static-$arch/ztest" "$stage/ztest"
+            install -m 0755 "artifacts/ztest-static-linux-$arch/ztest" "$stage/ztest"
             cp README.md LICENSE "$stage/"
             tar -czf "dist/ztest-v${ZTEST_VERSION}-linux-$arch.tar.gz" -C "$stage" ztest README.md LICENSE
             rm -rf "$stage"
           done
-          # The installer is a release asset: install.sh documents
-          # releases/latest/download/install.sh, so it must exist in the published
-          # release. It is not checksummed (a bootstrap script cannot verify
-          # itself); SHA256SUMS covers the binaries only.
           cp scripts/install.sh dist/install.sh
           chmod 0755 dist/install.sh
           (cd dist && sha256sum ztest-v*-linux-*.tar.gz > SHA256SUMS)
-          ls -l dist
-
-      - name: Build wheels
-        run: python3 scripts/build_wheels.py --dist dist --verify --version "$ZTEST_VERSION"
-
+      - name: Build and verify Linux wheels
+        run: python3 scripts/build_wheels.py --dist dist --verify --version "$ZTEST_VERSION" --target linux-x86_64 --target linux-aarch64
       - name: Install x86_64 wheel into a clean venv and run a suite
         run: sh packaging/pypi/smoke_test.sh "$(ls dist/*x86_64.whl)"
-
-      - name: aarch64 wheel integrity (cannot execute natively on this runner)
+      - name: Verify non-native wheel integrity
         run: |
-          set -euo pipefail
           WHL="$(ls dist/*aarch64.whl)"
-          # verify_wheel re-checks RECORD, the 0755 payload mode, WHEEL tags and
-          # the payload's ELF e_machine against the architecture in the filename
-          # tags — the only architecture gate available without executing it.
           python3 -c 'import sys; sys.path.insert(0, "scripts"); import build_wheels as bw; from pathlib import Path; bw.verify_wheel(Path(sys.argv[1]))' "$WHL"
-
-      - name: install.sh end-to-end (offline, from dist/)
+      - name: install.sh end-to-end (offline)
         run: |
           set -euo pipefail
           sh scripts/install.sh --from-dir dist --install-dir "$RUNNER_TEMP/ztest-bin"
           "$RUNNER_TEMP/ztest-bin/ztest" --version
           "$RUNNER_TEMP/ztest-bin/ztest" --collect-only tests/fixtures/python_files/tests
-
-      - name: Upload dist
+      - name: Upload Linux dist
         uses: actions/upload-artifact@v4
         with:
-          name: ztest-dist-v${{ env.ZTEST_VERSION }}
+          name: ztest-dist-linux-v${{ env.ZTEST_VERSION }}
           path: |
             dist/*.whl
-            dist/*.tar.gz
+            dist/*-linux-*.tar.gz
+            dist/install.sh
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  wheels-macos:
+    runs-on: macos-15
+    needs: [static-build]
+    env:
+      ZTEST_VERSION: "0.6.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download Darwin binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ztest-static-macos-*
+          path: artifacts
+      - name: Assemble Darwin tarballs and universal2
+        run: |
+          set -euo pipefail
+          mkdir -p dist universal
+          for arch in x86_64 arm64; do
+            stage="$(mktemp -d)"
+            install -m 0755 "artifacts/ztest-static-macos-$arch/ztest" "$stage/ztest"
+            cp README.md LICENSE "$stage/"
+            tar -czf "dist/ztest-v${ZTEST_VERSION}-macos-$arch.tar.gz" -C "$stage" ztest README.md LICENSE
+            rm -rf "$stage"
+          done
+          lipo -create artifacts/ztest-static-macos-x86_64/ztest artifacts/ztest-static-macos-arm64/ztest -output universal/ztest
+          chmod 0755 universal/ztest
+          codesign --sign - --force universal/ztest
+          python3 scripts/native_artifact.py universal/ztest --target macos-universal --codesign --frameworks
+          python3 scripts/check_sterility.py universal/ztest
+          stage="$(mktemp -d)"
+          install -m 0755 universal/ztest "$stage/ztest"
+          cp README.md LICENSE "$stage/"
+          tar -czf "dist/ztest-v${ZTEST_VERSION}-macos-universal.tar.gz" -C "$stage" ztest README.md LICENSE
+          rm -rf "$stage"
+          cp scripts/install.sh dist/install.sh
+          chmod 0755 dist/install.sh
+          (cd dist && if command -v sha256sum >/dev/null 2>&1; then sha256sum ztest-v*-macos-*.tar.gz > SHA256SUMS; else shasum -a 256 ztest-v*-macos-*.tar.gz > SHA256SUMS; fi)
+      - name: Build and verify Darwin wheels
+        run: python3 scripts/build_wheels.py --dist dist --verify --version "$ZTEST_VERSION" --target macos-x86_64 --target macos-arm64
+      - name: Native arm64 wheel smoke
+        run: sh packaging/pypi/smoke_test.sh "$(ls dist/*macosx*arm64.whl)"
+      - name: Verify all wheel RECORD/mode/tags/payload gates
+        run: python3 scripts/build_wheels.py --dist dist --verify --version "$ZTEST_VERSION" --target macos-x86_64 --target macos-arm64
+      - name: install.sh end-to-end (offline)
+        run: |
+          set -euo pipefail
+          sh scripts/install.sh --from-dir dist --install-dir "$RUNNER_TEMP/ztest-bin"
+          "$RUNNER_TEMP/ztest-bin/ztest" --version
+          "$RUNNER_TEMP/ztest-bin/ztest" --collect-only tests/fixtures/python_files/tests
+      - name: Upload Darwin dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztest-dist-macos-v${{ env.ZTEST_VERSION }}
+          path: |
+            dist/*.whl
+            dist/*-macos-*.tar.gz
             dist/install.sh
             dist/SHA256SUMS
           if-no-files-found: error

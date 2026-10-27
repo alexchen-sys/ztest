@@ -19,6 +19,7 @@ CI ``build-and-test`` job.
 from __future__ import annotations
 
 import sys
+import struct
 import zipfile
 from pathlib import Path
 
@@ -53,6 +54,15 @@ def make_elf(
 
 ELF_X86_64 = make_elf(bw.EM_X86_64)
 ELF_AARCH64 = make_elf(bw.EM_AARCH64)
+
+
+def make_macho(cputype: int) -> bytes:
+    """A minimal little-endian 64-bit Mach-O MH_EXECUTE header."""
+    return b"\xcf\xfa\xed\xfe" + struct.pack("<7I", cputype, 3, 2, 0, 0, 0, 0)
+
+
+MACHO_X86_64 = make_macho(0x01000007)
+MACHO_ARM64 = make_macho(0x0100000C)
 
 
 def dist_with(tmp_path: Path, files: dict[str, bytes]) -> Path:
@@ -159,7 +169,7 @@ def test_parse_wheel_filename_round_trip() -> None:
     python_tag, abi_tag, dist, tags = bw.parse_wheel_filename(Path(name))
     assert (python_tag, abi_tag, dist) == ("py3", "none", "ztest_runner")
     assert tags == ["manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64"]
-    assert bw.arch_for_tags(tags, name) == X86_64
+    assert bw.arch_for_tags(tags, name) == "linux-x86_64"
 
 
 @pytest.mark.parametrize(
@@ -270,3 +280,25 @@ def test_metadata_requires_python_311(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheel) as zf:
         metadata = zf.read(next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))).decode()
     assert "Requires-Python: >=3.11" in metadata
+
+
+# --------------------------------------------------------------- Mach-O ---
+def test_verify_macos_wheels_and_architecture(tmp_path: Path) -> None:
+    for target, payload in (("macos-x86_64", MACHO_X86_64), ("macos-arm64", MACHO_ARM64)):
+        wheel = build(tmp_path, target, payload)
+        bw.verify_wheel(wheel)
+        _python, _abi, _dist, tags = bw.parse_wheel_filename(wheel)
+        assert tags == bw.PLATFORM_TAGS[target]
+        assert tags[0].startswith("macosx_")
+
+
+def test_macos_wheel_rejects_swapped_macho_payload(tmp_path: Path) -> None:
+    wheel = build(tmp_path, "macos-arm64", MACHO_ARM64)
+    rewrite_payload(wheel, MACHO_X86_64)
+    with pytest.raises(SystemExit, match="requires thin Mach-O/arm64, got macho/x86_64"):
+        bw.verify_wheel(wheel)
+
+
+def test_default_targets_cover_linux_and_macos() -> None:
+    assert set(bw.PLATFORM_TAGS) == {"linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-arm64"}
+    assert bw.DEFAULT_VERSION == "0.6.0"

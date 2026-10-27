@@ -43,8 +43,11 @@ from __future__ import annotations
 
 import argparse
 import re
+import struct
 import sys
 from pathlib import Path
+
+from native_artifact import ArtifactError, inspect_image
 
 MIN_STRING = 4
 _PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09}
@@ -118,13 +121,24 @@ def scan_string(text: bytes) -> list[tuple[str, str]]:
     return findings
 
 
-def scan_binary(path: Path, min_len: int = MIN_STRING) -> tuple[int, list[tuple[str, str]]]:
-    data = path.read_bytes()
+def scan_bytes(data: bytes, min_len: int = MIN_STRING) -> tuple[str, str, int, list[tuple[str, str]]]:
+    """Validate ELF/Mach-O/FAT structure, then scan every printable byte run.
+
+    Path-literal rules are format-independent, but format validation prevents a
+    random file or truncated payload from earning a misleading "clean" result.
+    FAT slices remain in the byte stream, so literals in both architectures are
+    covered by the same scan.
+    """
+    kind, arch = inspect_image(data)
     strings = extract_strings(data, min_len)
     findings: list[tuple[str, str]] = []
     for text in strings:
         findings.extend(scan_string(text))
-    return len(strings), findings
+    return kind, arch, len(strings), findings
+
+
+def scan_binary(path: Path, min_len: int = MIN_STRING) -> tuple[str, str, int, list[tuple[str, str]]]:
+    return scan_bytes(path.read_bytes(), min_len)
 
 
 # --------------------------------------------------------------- self-test ---
@@ -164,6 +178,31 @@ _SELF_TEST_CLEAN: dict[str, bytes] = {
 }
 
 
+def _macho(cputype: int) -> bytes:
+    return b"\xcf\xfa\xed\xfe" + struct.pack("<7I", cputype, 3, 2, 0, 0, 0, 0)
+
+
+def _fat(payload_x86: bytes, payload_arm: bytes) -> bytes:
+    offset_x86 = 8 + 2 * 20
+    offset_arm = offset_x86 + len(payload_x86)
+    return (b"\xca\xfe\xba\xbe" + struct.pack(">I", 2)
+            + struct.pack(">5I", 0x01000007, 3, offset_x86, len(payload_x86), 0)
+            + struct.pack(">5I", 0x0100000C, 0, offset_arm, len(payload_arm), 0)
+            + payload_x86 + payload_arm)
+
+
+_SELF_TEST_BINARY_LEAKS = {
+    "thin Mach-O with host path": _macho(0x0100000C) + b"\0/mnt/hunt-data/build/ztest\0",
+    "universal2 with leak in second slice": _fat(_macho(0x01000007) + b"\0/tmp/ztest_ok\0",
+                                                   _macho(0x0100000C) + b"\0/home/runner/work/ztest/src/main.zig\0"),
+}
+_SELF_TEST_BINARY_CLEAN = {
+    "clean thin Mach-O": _macho(0x01000007) + b"\0/tmp/ztest_{d}_{d}_{x}\0",
+    "clean universal2": _fat(_macho(0x01000007) + b"\0/tmp/ztest_ok\0",
+                              _macho(0x0100000C) + b"\0/ztest_shim.py\0"),
+}
+
+
 def self_test(verbose: bool = False) -> list[str]:
     """Returns a list of failures; empty means the rules behave as documented."""
     failures: list[str] = []
@@ -183,6 +222,35 @@ def self_test(verbose: bool = False) -> list[str]:
     extracted = extract_strings(b"\x00\x01" + _SELF_TEST_LEAKS["absolute /home path"] + b"\x00")
     if not extracted:
         failures.append("extract_strings returned nothing for an embedded path literal")
+    for label, blob in _SELF_TEST_BINARY_LEAKS.items():
+        try:
+            kind, arch, _count, found = scan_bytes(blob)
+        except ArtifactError as error:
+            failures.append(f"Mach-O positive control rejected structurally: {label}: {error}")
+            continue
+        if not found:
+            failures.append(f"Mach-O positive control not detected: {label} ({kind}/{arch})")
+        elif verbose:
+            print(f"  ok  {kind}/{arch} leak detected: {label}")
+    for label, blob in _SELF_TEST_BINARY_CLEAN.items():
+        try:
+            kind, arch, _count, found = scan_bytes(blob)
+        except ArtifactError as error:
+            failures.append(f"Mach-O negative control rejected structurally: {label}: {error}")
+            continue
+        if found:
+            failures.append(f"Mach-O negative control flagged: {label} ({kind}/{arch}) -> {found}")
+        elif verbose:
+            print(f"  ok  clean {kind}/{arch}: {label}")
+    for label, blob in (("truncated Mach-O", b"\xcf\xfa\xed\xfe\0"),
+                        ("truncated FAT table", b"\xca\xfe\xba\xbe\0\0\0\2")):
+        try:
+            scan_bytes(blob)
+        except ArtifactError:
+            if verbose:
+                print(f"  ok  malformed binary rejected: {label}")
+        else:
+            failures.append(f"malformed binary accepted: {label}")
     return failures
 
 
@@ -201,8 +269,9 @@ def main() -> int:
             for failure in failures:
                 print(f"sterility self-test FAILED: {failure}", file=sys.stderr)
             return 2
-        print(f"sterility self-test: {len(_SELF_TEST_LEAKS)} leak controls and "
-              f"{len(_SELF_TEST_CLEAN)} clean controls behave as documented")
+        print(f"sterility self-test: {len(_SELF_TEST_LEAKS)} leak controls, "
+              f"{len(_SELF_TEST_CLEAN)} clean controls, {len(_SELF_TEST_BINARY_LEAKS)} Mach-O leak fixtures, "
+              f"{len(_SELF_TEST_BINARY_CLEAN)} Mach-O clean fixtures and 2 malformed controls behave as documented")
         if not args.binary:
             return 0
 
@@ -216,7 +285,11 @@ def main() -> int:
         print(f"error: {path} is not a file", file=sys.stderr)
         return 2
 
-    scanned, findings = scan_binary(path, args.min_string)
+    try:
+        kind, arch, scanned, findings = scan_binary(path, args.min_string)
+    except (OSError, ArtifactError) as error:
+        print(f"error: {path}: {error}", file=sys.stderr)
+        return 2
     if findings:
         print(f"::error::{path} leaks build-host paths ({len(findings)} occurrence(s))")
         for label, snippet in findings[: args.max_report]:
@@ -224,7 +297,7 @@ def main() -> int:
         if len(findings) > args.max_report:
             print(f"  ... {len(findings) - args.max_report} more")
         return 1
-    print(f"sterility: 0 matching strings in {path} ({scanned} strings scanned, {path.stat().st_size} bytes)")
+    print(f"sterility: 0 matching strings in {path} ({kind}/{arch}, {scanned} strings scanned, {path.stat().st_size} bytes)")
     return 0
 
 

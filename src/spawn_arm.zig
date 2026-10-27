@@ -8,37 +8,25 @@
 /// getppid verification right after arming: a parent that already died
 /// produces no retrospective signal.
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const linux = @import("pal/mod.zig").posix;
 const process = std.process;
 const Allocator = std.mem.Allocator;
+const pal = @import("pal/mod.zig");
 
 const SpawnArmError = process.SpawnError || Allocator.Error;
 
 /// Bounded reap for spawn-handshake error paths — blocking wait4 is
 /// forbidden (a SIGKILLed child dies fast; a hung one must not hang the supervisor).
 fn reapChildBoundedLocal(pid: i32, budget_ms: u32) void {
-    var st: i32 = 0;
-    var waited: u32 = 0;
-    while (waited < budget_ms) : (waited += 1) {
-        const rc = linux.wait4(pid, &st, linux.W.NOHANG, null);
-        if (linux.errno(rc) != .SUCCESS) return; // ECHILD: already reaped
-        if (rc == pid) return;
-        const ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
-        _ = linux.nanosleep(&ts, null);
-    }
+    _ = pal.reapChildBounded(pid, pal.monotonicMs() + budget_ms);
 }
 
 fn armPdeathsigChild(parent_pid: i32) void {
-    // The prctl result is checked — a child without pdeathsig is dangerous (fail-closed).
-    const prc = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0);
-    if (linux.errno(prc) != .SUCCESS) {
-        linux.exit_group(125);
-    }
-    if (@as(i32, @intCast(linux.getppid())) != parent_pid) {
-        // The parent already died between fork and arming: no retrospective signal —
-        // exit immediately (the CLOEXEC err pipe closes itself, the parent sees EOF).
-        linux.exit_group(125);
-    }
+    // The arming result is checked — a child without a death contract is dangerous (fail-closed).
+    // Linux: prctl(PR_SET_PDEATHSIG, SIGKILL) survives execve; Darwin: a kqueue(EVFILT_PROC)
+    // parent-death watcher is armed instead (same contract, different kernel mechanism).
+    pal.armPdeathsigPreExec(parent_pid);
 }
 
 /// fork + PR_SET_PDEATHSIG(SIGKILL) + execve. `environ_map` (optional) builds
@@ -161,6 +149,7 @@ pub fn spawnArmed(
 }
 
 test "spawnArmed: pdeathsig is armed on the exec'd child and survives exec" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     // Live integration test: spawn python3; the child reads its own
     // pdeathsig via PR_GET_PDEATHSIG (prctl(2)) — the value must be 9 (SIGKILL):
     // the arming happened in the child branch before execve and survived exec.

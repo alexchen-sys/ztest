@@ -1,8 +1,8 @@
 # ztest
 
-Process-supervised Python test runner in Zig: `pidfd`/`killpg` containment, a
-Zygote worker pool, 2.6× lower memory than `pytest-xdist`, `--llm` JSONL for AI
-agents.
+Process-supervised Python test runner in Zig: native process-group containment
+(`pidfd` on Linux, kqueue on macOS), a Zygote worker pool, 2.6× lower memory
+than `pytest-xdist` in the Linux benchmark, and `--llm` JSONL for AI agents.
 
 ## Install in 1 second
 
@@ -16,11 +16,15 @@ curl -LsSf https://raw.githubusercontent.com/alexchen-sys/ztest/main/scripts/ins
 curl -LsSf https://raw.githubusercontent.com/alexchen-sys/ztest/main/scripts/install.sh | sh -s -- --system
 ```
 
-Prebuilt static `musl` binaries (stripped, `x86_64` and `aarch64`) sit on
+Prebuilt static `musl` binaries for Linux `x86_64`/`aarch64` and Mach-O
+binaries for macOS `x86_64`/`arm64` sit on
 [GitHub Releases](https://github.com/alexchen-sys/ztest/releases) if you would
-rather not pipe a shell script; the installer verifies `SHA256SUMS` and honors
-`ZTEST_VERSION` / `ZTEST_INSTALL_DIR`. `ztest --version` prints
-`ztest 0.5.1 (Zig 0.17.0)`. Building from source needs Zig 0.17.0 and is
+rather not pipe a shell script. Darwin builds link the system libraries and
+carry an ad-hoc signature; a universal2 tarball is also published. Download a
+tarball and its `SHA256SUMS` for a manual installation, or let the installer
+select the asset and verify its checksum. The installer honors `ZTEST_VERSION`
+/ `ZTEST_INSTALL_DIR`. `ztest --version` prints
+`ztest 0.6.0 (Zig 0.17.0)`. Building from source needs Zig 0.17.0 and is
 covered at the end of this file.
 
 ## Why ztest
@@ -62,14 +66,16 @@ memory ceiling on suites where a monolithic `pytest` is OOM-killed.
 
 ## What is ztest
 
-ztest runs pytest suites under kernel-level process-group and `pidfd`
-containment. It keeps the Python test surface — `conftest.py`, fixtures,
+ztest runs pytest suites under kernel-level process-group containment. Linux
+uses `pidfd` identity and process waits; macOS uses kqueue process events. It keeps the Python test surface — `conftest.py`, fixtures,
 markers, `pytest.raises`, `unittest.TestCase` — and moves supervision,
 parallelism, and timeout enforcement into a native Zig supervisor.
 
-Every worker runs in its own process group under `PR_SET_PDEATHSIG`,
+On Linux every worker runs in its own process group under `PR_SET_PDEATHSIG`,
 `pidfd`-pinned identity, `waitid(WNOWAIT)` zombie pinning, and a subreaper
-sweep. The supervisor starts in ~1.2 ms (`--version`) without booting a master
+sweep. Darwin implements the same lifecycle layers with kqueue `NOTE_EXIT` /
+`NOTE_TRACK`, process groups and libproc inspection; see ADR-004 for its exact
+boundaries. The supervisor starts in ~1.2 ms (`--version`) without booting a master
 Python interpreter or `pluggy` plugin chain, and workers fork from a pre-warmed
 Python zygote to amortize interpreter startup across files.
 
@@ -87,13 +93,15 @@ and `_pytest` modules directly.
 - Hard per-test timeout (`--timeout=<sec>`, up to 86400). The worker arms an
   in-process timer while the supervisor enforces an outside inactivity window
   (`max(1500, sec*1000) + 1500` ms, or 1 h when `--timeout` is unset).
-- Race-free timeout kill: `pidfd_open` pins worker identity while
-  `waitid(WNOWAIT)` holds the zombie until `kill(-pgid, SIGKILL)` completes.
-- Three-layer process-tree containment: `PR_SET_PDEATHSIG` cascade, zygote EOF
+- Race-free timeout kill: Linux uses `pidfd_open` and `waitid(WNOWAIT)` to pin
+  worker identity; Darwin uses kqueue process-exit events and the same
+  process-group registry. Group kills complete before the group is reaped.
+- Three-layer process-tree containment: parent-death notification, zygote EOF
   watch, and a native watchdog over a shared process-group registry, plus a
-  per-file orphan sweep.
-- Nonblocking IPC over file descriptor 199 with CRC32 framing and `SO_PEERCRED`
-  peer authentication.
+  per-file orphan sweep. Linux uses `PR_SET_PDEATHSIG`; Darwin uses kqueue.
+- Nonblocking IPC over file descriptor 199 with CRC32 framing and authenticated
+  Unix-socket peer credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` or
+  `LOCAL_PEERPID` on Darwin).
 - Terminal progress view and `--llm` JSONL output (`{"t":"fail",...}`,
   `{"t":"crash",...}`, and `{"t":"summary",...}` with `passed`, `failed`,
   `skipped`, `deselected`, `crashed`, `collection_errors`, `collected`,
@@ -107,8 +115,10 @@ and `_pytest` modules directly.
 
 ## Requirements
 
-- Linux (`x86_64` and `aarch64`). The supervisor relies on `pidfd_open(2)`, `statx(2)`,
-  `prctl(PR_SET_PDEATHSIG)`, process groups and `/proc`.
+- Linux (`x86_64` and `aarch64`) or macOS (`x86_64` and `arm64`). Linux uses
+  `pidfd_open(2)`, `statx(2)`, `prctl(PR_SET_PDEATHSIG)`, process groups and
+  `/proc`; Darwin uses kqueue process events, process groups, libproc and
+  `/dev/fd`. Windows and other architectures are not supported.
 - Python 3.11 or newer at runtime, discoverable on `PATH` or passed with
   `--python=<path>`.
 - No build toolchain unless you build from source, which needs Zig 0.17.0.
@@ -202,6 +212,7 @@ ztest --maxfail=5 tests/
 | `--engine=native\|pytest` | Test execution engine: built-in zero-dependency shim (`native`, default) or in-worker upstream `pytest` bridge (`pytest`) for third-party `pluggy` plugins (also read from `ZTEST_ENGINE`) |
 | `--mode=zygote\|exec` | Worker start strategy (default: `zygote`) |
 | `--preload=<list>` | Comma-separated modules to pre-import once into the zygote (opt-in; default: stdlib only; engages above the 8-file small-suite threshold, never in single-file clean-spawn). Also read from `ZTEST_PRELOAD_PKGS` |
+| `--no-auto-preload` | Disable best-effort automatic preloading of the detected project package and optional heavy imports (also `ZTEST_AUTO_PRELOAD=0`) |
 | `--python=<path>` | Explicit Python 3.11+ interpreter |
 | `--collect-only`, `--co` | Collect and print test node IDs only |
 | `-s`, `--no-capture` | Do not capture stdout/stderr |
@@ -283,7 +294,8 @@ Not supported in the default `native` engine (use `--engine=pytest` when require
   is discovered by walking up from the target paths (a `pyproject.toml` counts
   only when it carries a `[tool.pytest.ini_options]` section), so running ztest
   from outside the project directory still picks up the project's ini options.
-- Windows, macOS, and Linux architectures other than `x86_64` and `aarch64`.
+- Windows and architectures other than Linux `x86_64`/`aarch64` and macOS
+  `x86_64`/`arm64`.
 
 Known differences from pytest, by design:
 
@@ -310,8 +322,8 @@ Known differences from pytest, by design:
 - [docs/adr/ADR-005-unittest-delegation.md](docs/adr/ADR-005-unittest-delegation.md) —
   the contract for delegating `unittest.TestCase` lifecycle to the real runner instead
   of imitating it.
-- [docs/adr/ADR-006-layout.md](docs/adr/ADR-006-layout.md) — why the shim is one
-  file and how `main.zig` is split.
+- [docs/adr/ADR-006-layout.md](docs/adr/ADR-006-layout.md) — how modular shim
+  sources become one embedded runtime bundle, and how `main.zig` is split.
 - [docs/adr/README.md](docs/adr/README.md) — ADR index and numbering policy.
 
 ## Development
@@ -340,7 +352,7 @@ ZTEST_BIN=zig-out/bin/ztest python3 -m pytest tests/test_oss_regressions.py -q
 The binary under test is `$ZTEST_BIN` when set, else this repo's `zig-out`
 build, else the first `ztest` on `PATH`.
 
-`ztest --version` prints the version: `ztest 0.5.1 (Zig 0.17.0)`.
+`ztest --version` prints the version: `ztest 0.6.0 (Zig 0.17.0)`.
 
 ## Benchmarks
 
@@ -354,7 +366,8 @@ reproducible from the manifest and the harness in `benchmarks/`.
 
 ## Limitations
 
-- Linux (`x86_64` and `aarch64`) only (see Requirements).
+- Windows and architectures outside the four targets in Requirements are not
+  supported.
 - A descendant that calls `setsid` and outlives the supervisor escapes group-based
   containment. While the supervisor runs, the orphan sweep finds and kills such
   processes; after it exits, nothing can. [ADR-004](docs/adr/ADR-004-process-containment.md)

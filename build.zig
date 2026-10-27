@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Build-time freshness gate: the monolithic embedded bundle is generated
+    // from the reviewed source modules, never edited independently.
+    const bundle_check = b.addSystemCommand(&.{ "python3", "scripts/bundle_shim.py", "--check" });
+
     // Release artifacts must be sterile: debug info embeds absolute build paths
     // (cache dirs, toolchain dirs, source roots) into the binary and inflates it
     // ~5x. Strip by default for every non-Debug build; `-Dstrip=false` opts out.
@@ -17,9 +21,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = strip,
-        // No `.link_libc`: nothing in the tree calls into libc (env is read via
+        // Linux stays libc-free: nothing there calls into libc (env is read via
         // std.process.Init.environ_map), so musl targets link fully static and
         // the glibc target keeps a stable, distro-independent ABI surface.
+        // Darwin is different by design: the PAL reaches kqueue(2), libproc and
+        // LOCAL_PEERCRED through libSystem, so macOS targets link libc and use
+        // Zig's bundled Darwin headers/stubs (no Xcode SDK required).
+        .link_libc = target.result.os.tag == .macos,
     });
 
     const exe = b.addExecutable(.{
@@ -27,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .root_module = root,
     });
     b.installArtifact(exe);
+    exe.step.dependOn(&bundle_check.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -43,6 +52,11 @@ pub fn build(b: *std.Build) void {
     const run_tests = std.Build.Step.Run.create(b, "run tests");
     run_tests.addArtifactArg(tests);
     run_tests.expectExitCode(0);
+    // Do not hide the last started test behind subprocess capture. Native
+    // process/PAL suites can hang independently of compilation, and the test
+    // name is the minimum evidence needed to diagnose the platform backend.
+    run_tests.stdio = .inherit;
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&bundle_check.step);
     test_step.dependOn(&run_tests.step);
 }

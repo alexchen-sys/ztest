@@ -2,7 +2,7 @@
 
 - Status: Accepted
 - Type: architecture decision record (ADR)
-- Applies to: 0.5.0 and later
+- Applies to: 0.5.0 and later; Darwin parity added in 0.6.0
 - Related: [invariant registry](../INVARIANTS.md), [ADR-005](ADR-005-unittest-delegation.md)
 
 ## Context
@@ -163,6 +163,49 @@ Rules that make the registry safe:
   so that a `WNOWAIT`-peeked zombie does not make a sweep loop. Without the
   exclusion, a sweep would kill the containment layer it is running under, and
   the final deferred teardown would then signal a reused pid.
+
+## Darwin parity (0.6.0)
+
+The three-layer contract is unchanged; Darwin supplies different kernel
+primitives. `src/pal/mod.zig` exposes one interface and `src/pal/darwin.zig`
+implements it. The Linux names in the preceding sections describe the Linux
+backend, not a claim that Darwin emulates those syscalls.
+
+- **Parent-death cascade.** Darwin has no `PR_SET_PDEATHSIG` or child
+  subreaper. The parent registers `EVFILT_PROC` with `NOTE_EXIT` on the
+  protected parent process (zygote for a forked worker, supervisor for a
+  clean-spawn worker), and kills the child's process group when that parent
+  exits. The existing `getppid` check after arming remains the race guard for
+  a parent that has already exited. `NOTE_FORK | NOTE_TRACK` tracks descendants
+  created by the protected zygote rather than replacing its death watch.
+  Process-group kills and the `pgid <= 1` fail-closed rule are identical on
+  both systems.
+- **Supervisor-death watchdog.** The run watchdog waits for the supervisor
+  with kqueue `EVFILT_PROC`/`NOTE_EXIT` instead of `pidfd_open` plus `poll`.
+  It still uses the same anonymous `MAP_SHARED` `PgidRegistry`, registers
+  groups before accept, and kills and unregisters before reap. This is a
+  kernel notification of the watched process, not a bare-pid polling loop.
+- **Peer identity.** Unix-socket authentication uses `LOCAL_PEERCRED` where
+  the credential structure is available and `LOCAL_PEERPID` for the direct
+  peer-pid path, replacing Linux `SO_PEERCRED`. The accepted peer must still
+  satisfy `getpgid(zygote_pid) == zygote_pid`; socket credentials do not
+  replace the group-identity check.
+- **Descriptor and process inspection.** `/dev/fd/1` replaces
+  `/proc/self/fd/1` when classifying captured output. Child enumeration uses
+  `proc_listchildpids`, and `proc_pidinfo` supplies process status and
+  parent/group fields for sweeps. Darwin does not adopt escaped descendants
+  through `PR_SET_CHILD_SUBREAPER`, so the Linux adoption sweep has no direct
+  equivalent; `ADR-004-BOUNDARY` remains explicit rather than being presented
+  as solved by libproc.
+- **Resource accounting.** `getrusage(RUSAGE_CHILDREN)` is available through
+  the same PAL boundary, but `ru_maxrss` is bytes on Darwin and KiB on Linux.
+  The backend normalizes that unit before reporting; CI must not compare a raw
+  Darwin value with a raw Linux value.
+
+The zygote EOF watch, CRC-framed nonblocking IPC, in-worker timer, outside
+inactivity window, and exact-wait/zombie identity rules remain platform
+invariants. kqueue replaces the process-lifecycle wait mechanism, not the
+containment policy or its fail-closed accounting.
 
 ## Invariants
 

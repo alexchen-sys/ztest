@@ -2441,9 +2441,14 @@ class TestShimInternals(unittest.TestCase):
             self.assertEqual(b5_sum["failed"], 0)
 
             # B1a: dropped stdout bytes on an unwritable FIFO sink must fail-closed (exit 2, never 0)
-            r_fd, w_fd = os.pipe()
+            # Darwin has no /proc and anonymous pipes reject fchmod(EINVAL);
+            # use a named FIFO whose mode can be changed via chmod(2).
+            fifo_path = tdp / "b1a_unwritable.fifo"
+            os.mkfifo(fifo_path, 0o600)
+            r_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+            w_fd = os.open(fifo_path, os.O_WRONLY)
             try:
-                os.fchmod(w_fd, 0o400)
+                os.chmod(fifo_path, 0o400)
                 r_b1 = subprocess.run(
                     [str(ZTEST_BIN), "--llm", "test_mt_0.py"],
                     cwd=b5_dir,
@@ -2455,6 +2460,7 @@ class TestShimInternals(unittest.TestCase):
             finally:
                 os.close(r_fd)
                 os.close(w_fd)
+                fifo_path.unlink(missing_ok=True)
             self.assertEqual(r_b1.returncode, 2, r_b1.stderr)
             self.assertIn("dropped", r_b1.stderr)
 
@@ -2609,8 +2615,8 @@ class TestLaneB3ShimCallBoundary(unittest.TestCase):
             rc = m.run_test_file(str(target), opts, ipc)
         finally:
             sock_a.close()
-            sock_b.close()
             reader.join(timeout=10)
+            sock_b.close()
         return rc, b"".join(chunks).decode("utf-8", "replace")
 
     def test_test_call_has_pytest_runner_frame_and_astroid_compensation(self) -> None:

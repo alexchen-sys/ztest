@@ -1,9 +1,9 @@
 #!/bin/sh
-# ztest installer — POSIX sh, no dependencies beyond curl/wget + tar + sha256sum.
+# ztest installer — POSIX sh, curl/wget + tar + sha256sum/shasum.
 #
 #   curl -LsSf https://github.com/alexchen-sys/ztest/releases/latest/download/install.sh | sh
 #   curl -LsSf https://raw.githubusercontent.com/alexchen-sys/ztest/main/scripts/install.sh | sh
-#   sh install.sh --version 0.5.1
+#   sh install.sh --version 0.6.0
 #   sh install.sh --system                 # /usr/local/bin instead of ~/.local/bin
 #   sh install.sh --from-dir ./dist        # offline: use a local release directory
 #
@@ -12,17 +12,19 @@
 # SHA256SUMS. The raw URL tracks `main` and works before a release exists.
 #
 # Environment:
-#   ZTEST_VERSION       release to install (default: 0.5.1)
+#   ZTEST_VERSION       release to install (default: 0.6.0)
 #   ZTEST_INSTALL_DIR   destination directory (default: ~/.local/bin, or /usr/local/bin with --system)
 #   ZTEST_DOWNLOAD_BASE base URL for release assets (default: the GitHub release for $ZTEST_VERSION)
-#   ZTEST_NO_VERIFY     set to 1 to skip SHA256SUMS verification (discouraged)
+#   ZTEST_NO_NETWORK=1  test/operator guard: fail before any download attempt
+#
+# Checksum verification is mandatory. No flag or environment variable disables it.
 #
 # Exit codes: 0 ok, 1 usage/environment error, 2 unsupported platform,
 #             3 download failed, 4 checksum mismatch, 5 install failed.
 set -eu
 
-SCRIPT_VERSION="0.5.1"
-DEFAULT_VERSION="0.5.1"
+SCRIPT_VERSION="0.6.0"
+DEFAULT_VERSION="0.6.0"
 REPO="alexchen-sys/ztest"
 BINARY_NAME="ztest"
 
@@ -33,16 +35,15 @@ Install ztest — a pytest-compatible test runner with a native Zig supervisor.
 Usage: install.sh [OPTIONS]
 
 Options:
-  --version <VERSION>   release to install (default: 0.5.1)
+  --version <VERSION>   release to install (default: 0.6.0)
   --system             install into /usr/local/bin (needs root or sudo)
   --install-dir <DIR>  install into DIR (overrides ZTEST_INSTALL_DIR)
   --from-dir <DIR>     install from a local release directory (offline)
   --force              replace a file at the target path that is not a ztest binary
-  --no-verify          skip SHA256SUMS verification
   --print-version      print the installer version and the default release
   -h, --help           show this help
 
-Environment: ZTEST_VERSION, ZTEST_INSTALL_DIR, ZTEST_DOWNLOAD_BASE, ZTEST_NO_VERIFY
+Environment: ZTEST_VERSION, ZTEST_INSTALL_DIR, ZTEST_DOWNLOAD_BASE, ZTEST_NO_NETWORK
 EOF
 }
 
@@ -53,9 +54,7 @@ VERSION="${ZTEST_VERSION:-$DEFAULT_VERSION}"
 MODE="user"
 INSTALL_DIR_ARG=""
 FROM_DIR=""
-VERIFY=1
 FORCE=0
-if [ "${ZTEST_NO_VERIFY:-0}" = "1" ]; then VERIFY=0; fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -73,7 +72,6 @@ while [ $# -gt 0 ]; do
             FROM_DIR="$2"; shift 2 ;;
         --from-dir=*) FROM_DIR="${1#*=}"; shift ;;
         --force) FORCE=1; shift ;;
-        --no-verify) VERIFY=0; shift ;;
         --print-version)
             say "ztest-install $SCRIPT_VERSION (default release $DEFAULT_VERSION)"
             exit 0 ;;
@@ -85,18 +83,20 @@ done
 # ---------------------------------------------------------------- platform ---
 OS="$(uname -s)"
 case "$OS" in
-    Linux) ;;
-    *) die "unsupported OS: $OS (ztest ships static Linux binaries only)" 2 ;;
+    Linux|Darwin) ;;
+    *) die "unsupported OS: $OS (ztest ships Linux and macOS binaries)" 2 ;;
 esac
 
 MACHINE="$(uname -m)"
-case "$MACHINE" in
-    x86_64|amd64) ARCH="x86_64" ;;
-    aarch64|arm64) ARCH="aarch64" ;;
-    *) die "unsupported architecture: $MACHINE (supported: x86_64, aarch64)" 2 ;;
+case "$OS:$MACHINE" in
+    Linux:x86_64|Linux:amd64) ARCH="x86_64"; ASSET_OS="linux" ;;
+    Linux:aarch64|Linux:arm64) ARCH="aarch64"; ASSET_OS="linux" ;;
+    Darwin:x86_64|Darwin:amd64) ARCH="x86_64"; ASSET_OS="macos" ;;
+    Darwin:arm64|Darwin:aarch64) ARCH="arm64"; ASSET_OS="macos" ;;
+    *) die "unsupported architecture: $OS/$MACHINE (supported: Linux x86_64/aarch64, macOS x86_64/arm64)" 2 ;;
 esac
 
-ASSET="${BINARY_NAME}-v${VERSION}-linux-${ARCH}.tar.gz"
+ASSET="${BINARY_NAME}-v${VERSION}-${ASSET_OS}-${ARCH}.tar.gz"
 
 # -------------------------------------------------------------- destination ---
 if [ -n "$INSTALL_DIR_ARG" ]; then
@@ -137,6 +137,7 @@ if [ -n "$FROM_DIR" ]; then
     cp "$FROM_DIR/$ASSET" "$TMPDIR_INSTALL/$ASSET"
     if [ -f "$FROM_DIR/SHA256SUMS" ]; then cp "$FROM_DIR/SHA256SUMS" "$TMPDIR_INSTALL/SHA256SUMS"; fi
 else
+    [ "${ZTEST_NO_NETWORK:-0}" != "1" ] || die "offline mode forbids downloading; use --from-dir with a verified release directory" 3
     BASE="${ZTEST_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download/v${VERSION}}"
     BASE="${BASE%/}"
     fetch() {
@@ -149,34 +150,32 @@ else
             die "need curl or wget to download ztest" 3
         fi
     }
-    say "downloading ${ASSET} (v${VERSION}, ${ARCH})"
+    say "downloading ${ASSET} (v${VERSION}, ${ASSET_OS}/${ARCH})"
     fetch "$BASE/$ASSET" "$TMPDIR_INSTALL/$ASSET" || die "download failed: $BASE/$ASSET" 3
-    if [ "$VERIFY" = "1" ]; then
-        fetch "$BASE/SHA256SUMS" "$TMPDIR_INSTALL/SHA256SUMS" \
-            || die "download failed: $BASE/SHA256SUMS (use --no-verify to skip)" 3
-    fi
+    fetch "$BASE/SHA256SUMS" "$TMPDIR_INSTALL/SHA256SUMS" \
+        || die "download failed: $BASE/SHA256SUMS" 3
 fi
 
 # ----------------------------------------------------------------- verify ---
-if [ "$VERIFY" = "1" ]; then
-    [ -f "$TMPDIR_INSTALL/SHA256SUMS" ] || die "SHA256SUMS missing (use --no-verify to skip)" 4
-    # Fixed-field match, not a regex: $ASSET embeds $VERSION, which comes from the
-    # user's environment. `grep -E` would interpret `.`/`+`/`[` in it as regex
-    # syntax and could silently match a different asset (or nothing).
-    EXPECTED="$(awk -v want="$ASSET" '
-        { name = $2; sub(/^\*/, "", name); if (name == want) { print $1; exit } }
-    ' "$TMPDIR_INSTALL/SHA256SUMS")"
-    [ -n "$EXPECTED" ] || die "$ASSET is not listed in SHA256SUMS" 4
-    if command -v sha256sum >/dev/null 2>&1; then
-        ACTUAL="$(sha256sum "$TMPDIR_INSTALL/$ASSET" | cut -d' ' -f1)"
-    elif command -v shasum >/dev/null 2>&1; then
-        ACTUAL="$(shasum -a 256 "$TMPDIR_INSTALL/$ASSET" | cut -d' ' -f1)"
-    else
-        die "need sha256sum or shasum to verify the download" 4
-    fi
-    [ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL)" 4
-    say "checksum verified: $ASSET"
+# The selected asset and the release checksum manifest are both mandatory. There
+# is deliberately no --no-verify / ZTEST_NO_VERIFY escape hatch.
+[ -f "$TMPDIR_INSTALL/SHA256SUMS" ] || die "SHA256SUMS missing" 4
+# Fixed-field match, not a regex: $ASSET embeds $VERSION, which comes from the
+# user's environment. `grep -E` would interpret `.`/`+`/`[` in it as regex
+# syntax and could silently match a different asset (or nothing).
+EXPECTED="$(awk -v want="$ASSET" '
+    { name = $2; sub(/^\*/, "", name); if (name == want) { print $1; exit } }
+' "$TMPDIR_INSTALL/SHA256SUMS")"
+[ -n "$EXPECTED" ] || die "$ASSET is not listed in SHA256SUMS" 4
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL="$(sha256sum "$TMPDIR_INSTALL/$ASSET" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL="$(shasum -a 256 "$TMPDIR_INSTALL/$ASSET" | cut -d' ' -f1)"
+else
+    die "need sha256sum or shasum to verify the download" 4
 fi
+[ "$EXPECTED" = "$ACTUAL" ] || die "checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL)" 4
+say "checksum verified: $ASSET"
 
 # ---------------------------------------------------------------- install ---
 mkdir -p "$TMPDIR_INSTALL/extract"

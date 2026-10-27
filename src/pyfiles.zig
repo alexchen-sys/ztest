@@ -1,14 +1,45 @@
 const std = @import("std");
-const linux = std.os.linux;
+const linux = @import("pal/mod.zig").posix;
 
 pub const PyFileScan = enum { no_section, no_key, found_key };
+/// Why a configuration reader stopped without a usable result. The two cases were
+/// historically fused into one boolean and surfaced to the user as the same message;
+/// they carry different rc-4 diagnostics, so they are distinct enum tags now.
+pub const ConfigReadStatus = enum { ok, too_large };
+pub const ConfigError = error{ ConfigTooLarge, TooManyPatterns };
 pub const PyFilePatterns = struct {
     pats: [256][]const u8 = undefined,
     len: usize = 0,
+    /// True when >256 patterns were found: the pattern-table limit, not the file-size limit.
     overflow: bool = false,
+    /// True when the config file itself exceeded the 256 KiB read budget. Diagnostics
+    /// key off this separately from `overflow` (ConfigTooLarge vs TooManyPatterns).
+    config_too_large: bool = false,
+    config_path_buf: [4224]u8 = undefined,
+    config_path_len: usize = 0,
     buf: [65536]u8 = undefined,
     buf_len: usize = 0,
+
+    pub fn configPath(self: *const PyFilePatterns) []const u8 {
+        return self.config_path_buf[0..self.config_path_len];
+    }
 };
+
+/// Keep file-size overflow independent from the 256-entry pattern table and
+/// retain the offending path for the rc-4 diagnostic at the CLI boundary.
+pub fn validateConfigLimits(pats: *const PyFilePatterns, norecurse: *const PyFilePatterns) ConfigError!void {
+    if (pats.config_too_large or norecurse.config_too_large) return error.ConfigTooLarge;
+    if (pats.overflow or norecurse.overflow) return error.TooManyPatterns;
+}
+
+fn setConfigReadResult(out: *PyFilePatterns, path_z: [*:0]const u8, status: ConfigReadStatus) void {
+    out.* = .{ .config_too_large = status == .too_large };
+    if (status != .too_large) return;
+    const path = std.mem.span(path_z);
+    const n = @min(path.len, out.config_path_buf.len);
+    @memcpy(out.config_path_buf[0..n], path[0..n]);
+    out.config_path_len = n;
+}
 pub fn defaultPyFilePatterns() PyFilePatterns {
     var p: PyFilePatterns = .{};
     p.pats[0] = "test_*.py";
@@ -147,45 +178,45 @@ pub fn loadNorecursedirs(root_path: []const u8, out: *PyFilePatterns) bool {
         const dir = dir_buf[0..dir_len];
         var pbuf: [4224]u8 = undefined;
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/pytest.ini", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniNorecursedirs(cfg_buf[0..n], "pytest", out)) {
                     .found_key => return true,
-                    else => return out.overflow, // pytest.ini — rootdir; key not set
+                    else => return out.config_too_large, // pytest.ini — rootdir; key not set
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/pyproject.toml", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanTomlNorecursedirs(cfg_buf[0..n], out)) {
                     .found_key => return true,
-                    .no_key => return out.overflow, // ini_options present — rootdir
-                    .no_section => if (ov) return true,
+                    .no_key => return out.config_too_large, // ini_options present — rootdir
+                    .no_section => if (status == .too_large) return true,
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/tox.ini", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniNorecursedirs(cfg_buf[0..n], "pytest", out)) {
                     .found_key => return true,
-                    .no_key => return out.overflow,
-                    .no_section => if (ov) return true,
+                    .no_key => return out.config_too_large,
+                    .no_section => if (status == .too_large) return true,
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/setup.cfg", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniNorecursedirs(cfg_buf[0..n], "tool:pytest", out)) {
                     .found_key => return true,
-                    .no_key => return out.overflow,
-                    .no_section => if (ov) return true,
+                    .no_key => return out.config_too_large,
+                    .no_section => if (status == .too_large) return true,
                 }
             }
         } else |_| {}
@@ -199,6 +230,54 @@ pub fn loadNorecursedirs(root_path: []const u8, out: *PyFilePatterns) bool {
     }
     return false;
 }
+/// Reads the project package name from pyproject.toml: [project].name, then
+/// [tool.poetry].name as the Poetry fallback. Line-scoped TOML only — the shim's
+/// `_project_detect.py` is the authoritative parser; this Zig helper must stay
+/// intentionally narrow (no multiline strings, no tables beyond the two we scan).
+/// Returns null when the file is absent, unreadable, too large, or nameless.
+pub fn readProjectName(alloc: std.mem.Allocator, dir: []const u8) !?[]u8 {
+    var pbuf: [4224]u8 = undefined;
+    const pz = std.fmt.bufPrintSentinel(&pbuf, "{s}/pyproject.toml", .{dir}, 0) catch return null;
+    var cfg_buf: [262144]u8 = undefined;
+    var status: ConfigReadStatus = .ok;
+    const n = readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status) orelse return null;
+    if (status == .too_large) return null; // silent skip: a giant pyproject must not kill the run
+    const content = cfg_buf[0..n];
+    if (scanTomlProjectName(content, alloc)) |name| return name;
+    return null;
+}
+
+fn scanTomlProjectName(content: []const u8, alloc: std.mem.Allocator) ?[]u8 {
+    var section: enum { none, project, poetry } = .none;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, line, ']') orelse line.len;
+            const hdr = std.mem.trim(u8, line[1..end], " \t");
+            section = .none;
+            if (std.mem.eql(u8, hdr, "project")) section = .project;
+            if (std.mem.eql(u8, hdr, "tool.poetry")) section = .poetry;
+            continue;
+        }
+        if (section == .none) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        if (!std.mem.eql(u8, key, "name")) continue;
+        var rhs = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        const hash = std.mem.indexOfScalar(u8, rhs, '#') orelse rhs.len;
+        rhs = std.mem.trim(u8, rhs[0..hash], " \t");
+        if (rhs.len < 2) continue;
+        if (rhs.len >= 2 and ((rhs[0] == '"' and rhs[rhs.len - 1] == '"') or (rhs[0] == '\'' and rhs[rhs.len - 1] == '\''))) {
+            rhs = rhs[1 .. rhs.len - 1];
+        }
+        if (rhs.len == 0) continue;
+        return alloc.dupe(u8, rhs) catch return null;
+    }
+    return null;
+}
+
 pub fn norecurseMatch(pats: *const PyFilePatterns, basename: []const u8, joined: []const u8) bool {
     var i: usize = 0;
     while (i < pats.len) : (i += 1) {
@@ -400,10 +479,15 @@ pub fn scanTomlPythonFiles(content: []const u8, out: *PyFilePatterns) PyFileScan
     return scanTomlKeyImpl(content, "python_files", "ini_options.python_files", out);
 }
 pub fn readFileIntoBuf(path_z: [*:0]const u8, buf: []u8) ?usize {
-    var dummy_ov = false;
-    return readConfigIntoBuf(path_z, buf, &dummy_ov);
+    var dummy_status: ConfigReadStatus = .ok;
+    return readConfigIntoBuf(path_z, buf, &dummy_status);
 }
-pub fn readConfigIntoBuf(path_z: [*:0]const u8, buf: []u8, overflow_out: *bool) ?usize {
+/// Reads a pytest-style config into a fixed buffer. A full buffer that still has at
+/// least one unread byte behind it is reported as `.too_large` — a distinct condition
+/// from pattern-table overflow, with its own rc-4 diagnostic. A file of exactly
+/// buf.len bytes stays `.ok` (the read consumed everything).
+pub fn readConfigIntoBuf(path_z: [*:0]const u8, buf: []u8, status_out: *ConfigReadStatus) ?usize {
+    status_out.* = .ok;
     const rc = linux.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
@@ -418,9 +502,66 @@ pub fn readConfigIntoBuf(path_z: [*:0]const u8, buf: []u8, overflow_out: *bool) 
     if (total == buf.len) {
         var extra: [1]u8 = undefined;
         const m = linux.read(fd, &extra, 1);
-        if (linux.errno(m) == .SUCCESS and m > 0) overflow_out.* = true;
+        if (linux.errno(m) == .SUCCESS and m > 0) status_out.* = .too_large;
     }
     return total;
+}
+
+test "config read status distinguishes exact limit from oversized input" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const exact: [16]u8 = @splat('x');
+    const oversized: [17]u8 = @splat('y');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pyproject.toml", .data = &exact });
+    var path_buf: [4096]u8 = undefined;
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/pyproject.toml", .{tmp.sub_path}, 0);
+    var small: [16]u8 = undefined;
+    var status: ConfigReadStatus = .too_large;
+    try std.testing.expectEqual(@as(?usize, 16), readConfigIntoBuf(path_z.ptr, &small, &status));
+    try std.testing.expectEqual(ConfigReadStatus.ok, status);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pyproject.toml", .data = &oversized });
+    try std.testing.expectEqual(@as(?usize, 16), readConfigIntoBuf(path_z.ptr, &small, &status));
+    try std.testing.expectEqual(ConfigReadStatus.too_large, status);
+}
+
+test "oversized config and pattern overflow remain independent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [4096]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const oversized: [256 * 1024 + 1]u8 = @splat('#');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pyproject.toml", .data = &oversized });
+    var pats: PyFilePatterns = .{};
+    loadPythonFilePatterns(root, &pats);
+    try std.testing.expect(pats.config_too_large);
+    try std.testing.expect(!pats.overflow);
+
+    var content_buf: [8192]u8 = undefined;
+    var used: usize = 0;
+    const header = "[tool.pytest.ini_options]\npython_files = ";
+    @memcpy(content_buf[used..][0..header.len], header);
+    used += header.len;
+    for (0..257) |i| {
+        const part = try std.fmt.bufPrint(content_buf[used..], "case_{d}.py ", .{i});
+        used += part.len;
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pyproject.toml", .data = content_buf[0..used] });
+    loadPythonFilePatterns(root, &pats);
+    try std.testing.expect(pats.overflow);
+    try std.testing.expect(!pats.config_too_large);
+}
+
+test "project name prefers PEP 621 then falls back to Poetry" {
+    const alloc = std.testing.allocator;
+    const pep = scanTomlProjectName("[project]\nname = 'demo-pkg'\n[tool.poetry]\nname = 'fallback'\n", alloc).?;
+    try std.testing.expectEqualStrings("demo-pkg", pep);
+    alloc.free(pep);
+    const poetry = scanTomlProjectName("[tool.poetry]\nname = \"poetry_pkg\"\n", alloc).?;
+    try std.testing.expectEqualStrings("poetry_pkg", poetry);
+    alloc.free(poetry);
+    try std.testing.expect(scanTomlProjectName("[project]\ndescription = 'nameless'\n", alloc) == null);
 }
 pub fn loadPythonFilePatterns(root_path: []const u8, out: *PyFilePatterns) void {
     // The pats slices point into out.buf — out lives at the caller; returning the
@@ -458,76 +599,76 @@ pub fn loadPythonFilePatterns(root_path: []const u8, out: *PyFilePatterns) void 
         var pbuf: [4224]u8 = undefined;
 
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/pytest.ini", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniPythonFiles(cfg_buf[0..n], "pytest", out)) {
                     .found_key => return,
                     .no_key => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
                     .no_section => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     }, // pytest.ini found — rootdir resolved
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/pyproject.toml", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanTomlPythonFiles(cfg_buf[0..n], out)) {
                     .found_key => return,
                     .no_key => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
-                    .no_section => if (ov) {
+                    .no_section => if (status == .too_large) {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = true;
+                        out.config_too_large = true;
                         return;
-                    }, // pyproject without ini_options — not a pytest config, keep walking
+                    }, // pyproject without ini_options — oversized input is an error
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/tox.ini", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniPythonFiles(cfg_buf[0..n], "pytest", out)) {
                     .found_key => return,
                     .no_key => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
                     .no_section => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
                 }
             }
         } else |_| {}
         if (std.fmt.bufPrintSentinel(&pbuf, "{s}/setup.cfg", .{dir}, 0)) |pz| {
-            var ov = false;
-            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &ov)) |n| {
-                out.* = .{ .overflow = ov };
+            var status: ConfigReadStatus = .ok;
+            if (readConfigIntoBuf(pz.ptr, cfg_buf[0..], &status)) |n| {
+                out.* = .{ .overflow = false, .config_too_large = status == .too_large };
                 switch (scanIniPythonFiles(cfg_buf[0..n], "tool:pytest", out)) {
                     .found_key => return,
                     .no_key => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
                     .no_section => {
                         out.* = defaultPyFilePatterns();
-                        out.overflow = ov;
+                        out.config_too_large = status == .too_large;
                         return;
                     },
                 }

@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-26
+
+Darwin platform support and a modular shim source layout, with the same
+single-binary deployment and process-containment contract.
+
+### Added
+
+- macOS `x86_64` and `arm64` support through `src/pal/`: kqueue-based
+  parent/supervisor death notification (`NOTE_EXIT`, `NOTE_FORK`,
+  `NOTE_TRACK`), `LOCAL_PEERCRED`/`LOCAL_PEERPID` peer identity,
+  libproc-backed child inspection, `/dev/fd` descriptor handling, and Darwin
+  `ru_maxrss` unit normalization. The existing process-group registry and
+  inactivity enforcement remain shared. See
+  [ADR-004](docs/adr/ADR-004-process-containment.md).
+- Thin Mach-O wheels for `macosx_10_13_x86_64` and `macosx_11_0_arm64`, plus the
+  existing two static-musl Linux wheels. Release assembly also produces a
+  universal2 tarball from both thin Darwin binaries.
+- `scripts/install.sh` support for Darwin `arm64` and `x86_64`, with
+  `sha256sum` or macOS `shasum -a 256`. SHA256SUMS verification is mandatory
+  for both online and offline installation; version and atomic-replacement
+  checks are unchanged.
+- Automatic best-effort import of the detected project package into the
+  zygote, disabled by `--no-auto-preload` or `ZTEST_AUTO_PRELOAD=0`.
+- The shim is split into numbered source sections under `src/shim/modules/`
+  and deterministically bundled by `scripts/bundle_shim.py`; `build.zig`
+  enforces bundle freshness. The separately importable, stdlib-only project
+  detector is embedded and extracted beside the shim.
+- Mach-O and FAT-aware release validation: thin wheel payloads require the
+  advertised cputype, universal2 requires exactly one `x86_64` and one `arm64`
+  slice, and the sterility gate scans both slices for build-host paths.
+
+### Changed
+
+- Configuration-size failures distinguish a single oversized value from the
+  aggregate serialized configuration limit (`ConfigTooLarge`) instead of
+  collapsing both into one diagnostic.
+- Release CI builds and gates four target artifacts, runs behavioral tests on
+  native Darwin runners, and checks Darwin ad-hoc signatures and system-only
+  dynamic linkage with Apple tools.
+
 ## [0.5.1] - 2026-10-25
 
 Distribution, reporting, and parity release. No change to the supervisor or the

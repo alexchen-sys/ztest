@@ -1,5 +1,5 @@
 const std = @import("std");
-const linux = std.os.linux;
+const linux = @import("pal/mod.zig").posix;
 
 fn warnSystemInterpreterFallback(path: []const u8) void {
     var buf: [512]u8 = undefined;
@@ -211,6 +211,9 @@ pub const ParsedCli = struct {
     /// by default: the zygote preloads stdlib modules only; any listed module is
     /// forwarded to the zygote env as ZTEST_PRELOAD_PKGS.
     preload_pkgs: []const u8 = "",
+    /// --no-auto-preload: opt out of the automatic project-package and heavy-module
+    /// preload into the zygote. Overrides ZTEST_AUTO_PRELOAD=1. Default = auto-preload on.
+    no_auto_preload: bool = false,
     /// Execution engine inside the supervised worker: `false` (default) uses
     /// the zero-dependency native shim; `true` (`--engine=pytest`) delegates
     /// collection and execution inside each isolated worker to upstream pytest
@@ -337,6 +340,8 @@ pub fn parseCliArgs(
             i += 1;
             if (!validPreloadList(args[i])) return error.UsageError;
             cli.preload_pkgs = args[i];
+        } else if (std.mem.eql(u8, arg, "--no-auto-preload")) {
+            cli.no_auto_preload = true;
         } else if (std.mem.startsWith(u8, arg, "-k=")) {
             const ke = arg["-k=".len..];
             if (!validFilterExpr(ke)) return error.UsageError;
@@ -493,6 +498,16 @@ test "--preload parses a comma-separated module list and rejects malformed value
     const plain = [_][]const u8{"ztest"};
     cli = try parseCliArgs(alloc, &plain, &targets);
     try std.testing.expectEqualStrings("", cli.preload_pkgs);
+    try std.testing.expect(!cli.no_auto_preload);
+
+    // The explicit opt-out is independent from --preload and remains set when
+    // the two options are combined; targets after it stay positional.
+    targets.clearRetainingCapacity();
+    const no_auto = [_][]const u8{ "ztest", "--no-auto-preload", "--preload=pydantic", "tests" };
+    cli = try parseCliArgs(alloc, &no_auto, &targets);
+    try std.testing.expect(cli.no_auto_preload);
+    try std.testing.expectEqualStrings("pydantic", cli.preload_pkgs);
+    try std.testing.expectEqual(@as(usize, 1), targets.items.len);
 
     // Malformed lists fail fast with a usage error instead of reaching the zygote.
     const bad_empty = [_][]const u8{ "ztest", "--preload=" };

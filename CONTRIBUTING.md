@@ -43,6 +43,12 @@ project can receive.
   green, and so must `zig build test`.
 - If your change adds or removes a guard tagged with an `Invariants:` key, run
   `python3 scripts/check_docs.py`; CI runs it too.
+- Packaging changes run `python3 -m pytest scripts/test_build_wheels.py -q`,
+  `python3 -m unittest scripts.test_native_artifact scripts.test_bundle_shim scripts.test_installer -q`,
+  `python3 scripts/check_sterility.py --self-test`, and
+  `python3 scripts/bundle_shim.py --check`. Native Darwin signature, framework
+  and wheel smoke checks run on macOS CI runners; a Linux cross-build does not
+  replace them.
 - Keep the compatibility claims in `README.md` accurate: if a change widens or
   narrows the supported pytest surface, update the README in the same commit.
 - Code comments and commit messages are written in English.

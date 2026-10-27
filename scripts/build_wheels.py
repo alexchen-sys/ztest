@@ -50,14 +50,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DIST_NAME = "ztest-runner"
 MODULE = "ztest_runner"
-DEFAULT_VERSION = "0.5.1"
+DEFAULT_VERSION = "0.6.0"
 
-# arch -> platform tags, best (most specific) first. every tag is truthful:
-# the payload is a fully static musl binary.
+# Wheel target -> pip platform tags. Linux payloads are static musl; macOS
+# wheels intentionally use the oldest pip-accepted macOS tag: the wheel tag is
+# a compatibility floor, not a claim of a newer SDK than the payload requires.
 PLATFORM_TAGS = {
-    "x86_64": ["manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64"],
-    "aarch64": ["manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64"],
+    "linux-x86_64": ["manylinux_2_17_x86_64", "manylinux2014_x86_64", "musllinux_1_1_x86_64"],
+    "linux-aarch64": ["manylinux_2_17_aarch64", "manylinux2014_aarch64", "musllinux_1_1_aarch64"],
+    "macos-x86_64": ["macosx_10_13_x86_64"],
+    "macos-arm64": ["macosx_11_0_arm64"],
 }
+# Backwards-compatible local iteration API: an unqualified arch means Linux.
+LEGACY_ARCH_TARGETS = {"x86_64": "linux-x86_64", "aarch64": "linux-aarch64", "arm64": "macos-arm64"}
 
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
@@ -71,6 +76,8 @@ EM_X86_64 = 62
 EM_AARCH64 = 183
 ARCH_E_MACHINE = {"x86_64": EM_X86_64, "aarch64": EM_AARCH64}
 E_MACHINE_NAMES = {EM_X86_64: "x86_64", EM_AARCH64: "aarch64"}
+
+from native_artifact import ArtifactError, check_release
 
 WHEEL_NAME_RE = re.compile(
     r"^(?P<dist>[A-Za-z0-9_.]+)-(?P<version>[^-]+)-(?P<python>[^-]+)-(?P<abi>[^-]+)-(?P<platform>.+)\.whl$"
@@ -89,7 +96,8 @@ Classifier: Development Status :: 4 - Beta
 Classifier: Environment :: Console
 Classifier: Intended Audience :: Developers
 Classifier: License :: OSI Approved :: MIT License
-Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: POSIX
+Classifier: Operating System :: MacOS
 Classifier: Programming Language :: Python :: 3
 Classifier: Topic :: Software Development :: Testing
 Description-Content-Type: text/markdown
@@ -178,8 +186,20 @@ def check_elf_arch(data: bytes, arch: str, origin: str = "payload") -> int:
     return machine
 
 
+def check_payload_target(data: bytes, target: str, origin: str = "payload") -> str:
+    """Validate ELF or thin Mach-O identity for a wheel target."""
+    try:
+        if target.startswith("linux-"):
+            check_elf_arch(data, target.split("-", 1)[1], origin)
+        else:
+            check_release(data, target, origin)
+        return target
+    except ArtifactError as error:
+        raise SystemExit(str(error)) from error
+
+
 def arch_for_tags(tags: list[str], origin: str) -> str:
-    """The single ELF architecture a wheel's platform tags promise."""
+    """The single wheel target promised by the filename's platform tags."""
     if not tags:
         raise SystemExit(f"{origin}: no platform tags")
     duplicates = sorted({tag for tag in tags if tags.count(tag) > 1})
@@ -187,7 +207,7 @@ def arch_for_tags(tags: list[str], origin: str) -> str:
         raise SystemExit(f"{origin}: duplicate platform tags {duplicates}")
     arches: set[str] = set()
     for tag in tags:
-        owners = [arch for arch, known in PLATFORM_TAGS.items() if tag in known]
+        owners = [target for target, known in PLATFORM_TAGS.items() if tag in known]
         if not owners:
             raise SystemExit(f"{origin}: platform tag {tag!r} has no ELF architecture mapping")
         if len(owners) > 1:
@@ -211,17 +231,14 @@ def parse_wheel_filename(path: Path) -> tuple[str, str, str, list[str]]:
 
 
 def find_binary(dist_dir: Path, arch: str, version: str) -> tuple[bytes, str]:
-    """Locate the prebuilt binary for `arch`, preferring the release tarball.
-
-    Only architecture-bound names are accepted. A bare ``dist/ztest`` used to be
-    a fallback for quick iteration, but it carries no architecture: packaging one
-    x86_64 binary under both sets of tags produced an aarch64 wheel with an
-    x86_64 payload and no gate noticed. The payload's ELF header is checked here
-    as well, so even a mislabelled ``ztest-aarch64`` file cannot get through.
-    """
+    """Locate an OS/architecture-bound binary and validate its native header."""
+    target = LEGACY_ARCH_TARGETS.get(arch, arch)
+    if target not in PLATFORM_TAGS:
+        raise SystemExit(f"unknown wheel target {arch!r}")
+    os_name, payload_arch = target.split("-", 1)
     tarballs = [
-        dist_dir / f"ztest-v{version}-linux-{arch}.tar.gz",
-        dist_dir / f"ztest-{version}-linux-{arch}.tar.gz",
+        dist_dir / f"ztest-v{version}-{os_name}-{payload_arch}.tar.gz",
+        dist_dir / f"ztest-{version}-{os_name}-{payload_arch}.tar.gz",
     ]
     for tb in tarballs:
         if tb.is_file():
@@ -238,17 +255,17 @@ def find_binary(dist_dir: Path, arch: str, version: str) -> tuple[bytes, str]:
                 fh = tf.extractfile(member)
                 assert fh is not None
                 data = fh.read()
-                check_elf_arch(data, arch, f"{tb.name}:{member.name}")
+                check_payload_target(data, target, f"{tb.name}:{member.name}")
                 return data, f"{tb.name}:{member.name}"
-    for name in (f"ztest-{arch}", f"ztest-{version}-{arch}"):
+    for name in (f"ztest-{payload_arch}", f"ztest-{target}", f"ztest-{version}-{target}", f"ztest-{version}-{payload_arch}"):
         cand = dist_dir / name
         if cand.is_file():
             data = cand.read_bytes()
-            check_elf_arch(data, arch, cand.name)
+            check_payload_target(data, target, cand.name)
             return data, cand.name
     raise SystemExit(
-        f"no prebuilt {arch} binary in {dist_dir} "
-        f"(expected ztest-v{version}-linux-{arch}.tar.gz or ztest-{arch}; a bare "
+        f"no prebuilt {target} binary in {dist_dir} "
+        f"(expected ztest-v{version}-{os_name}-{payload_arch}.tar.gz or ztest-{payload_arch}; a bare "
         f"`ztest` has no architecture and is rejected)"
     )
 
@@ -265,13 +282,14 @@ def zip_write(zf: zipfile.ZipFile, name: str, data: bytes, mode: int = 0o644) ->
 
 
 def build_wheel(dist_dir: Path, arch: str, version: str, long_description: str) -> Path:
-    tags = PLATFORM_TAGS[arch]
+    target = LEGACY_ARCH_TARGETS.get(arch, arch)
+    tags = PLATFORM_TAGS[target]
     dist_info = f"{MODULE}-{version}.dist-info"
     data_dir = f"{MODULE}-{version}.data"
     wheel_name = f"{MODULE}-{version}-py3-none-{'.'.join(tags)}.whl"
     out = dist_dir / wheel_name
 
-    binary, origin = find_binary(dist_dir, arch, version)
+    binary, origin = find_binary(dist_dir, target, version)
     if not binary:
         raise SystemExit(f"{origin}: empty binary")
 
@@ -320,7 +338,7 @@ def _single_member(names: list[str], suffix: str, origin: str) -> str:
 def verify_wheel(path: Path) -> None:
     """Fail loudly if RECORD, tags, payload architecture or mode are wrong."""
     python_tag, abi_tag, _dist, platform_tags = parse_wheel_filename(path)
-    expected_arch = arch_for_tags(platform_tags, path.name)
+    expected_target = arch_for_tags(platform_tags, path.name)
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
         bad = zf.testzip()
@@ -333,7 +351,7 @@ def verify_wheel(path: Path) -> None:
         if mode != 0o755:
             raise SystemExit(f"{path.name}: payload mode is {oct(mode)}, expected 0o755")
         payload = zf.read(script)
-        check_elf_arch(payload, expected_arch, f"{path.name}:{script}")
+        check_payload_target(payload, expected_target, f"{path.name}:{script}")
         recorded = {}
         for line in zf.read(record_name).decode().splitlines():
             parts = line.rsplit(",", 2)
@@ -354,7 +372,8 @@ def verify_wheel(path: Path) -> None:
                  for ln in wheel_meta.splitlines() if ln.startswith("Tag:")}
     if file_tags != meta_tags:
         raise SystemExit(f"{path.name}: WHEEL tags {sorted(meta_tags)} != filename tags {sorted(file_tags)}")
-    print(f"[verify] {path.name}: RECORD ok, mode 0755, ELF {expected_arch}, "
+    native_label = ("ELF " + expected_target.split("-", 1)[1]) if expected_target.startswith("linux-") else "Mach-O"
+    print(f"[verify] {path.name}: RECORD ok, mode 0755, {native_label}, "
           f"{len(names)} members, tags {sorted(platform_tags)}")
 
 
@@ -362,7 +381,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="build ztest platform wheels from prebuilt static binaries")
     ap.add_argument("--dist", default=str(REPO_ROOT / "dist"), help="directory holding binaries/tarballs; wheels are written here")
     ap.add_argument("--version", default=os.environ.get("ZTEST_VERSION", DEFAULT_VERSION))
-    ap.add_argument("--arch", action="append", choices=sorted(PLATFORM_TAGS), help="restrict to one architecture (repeatable)")
+    ap.add_argument("--target", "--arch", dest="targets", action="append", choices=sorted(PLATFORM_TAGS | LEGACY_ARCH_TARGETS), help="restrict to one OS/architecture target (repeatable)")
     ap.add_argument("--verify", action="store_true", help="re-verify wheels after writing")
     ap.add_argument("--sums", default="SHA256SUMS", help="file name for the checksum manifest inside --dist ('' disables)")
     args = ap.parse_args()
@@ -374,8 +393,8 @@ def main() -> int:
     readme = REPO_ROOT / "README.md"
     long_description = readme.read_text(encoding="utf-8") if readme.is_file() else "ztest"
 
-    archs = args.arch or [a for a in ("x86_64", "aarch64")]
-    built = [build_wheel(dist_dir, arch, version, long_description) for arch in archs]
+    targets = args.targets or list(PLATFORM_TAGS)
+    built = [build_wheel(dist_dir, target, version, long_description) for target in targets]
 
     if args.sums:
         sums_path = dist_dir / args.sums
